@@ -2,6 +2,32 @@
 
 Claude Code subagents and supporting tooling.
 
+## pr-reviewer
+
+Reviews open GitHub pull requests — by default every repo owned by
+`robertncl` — for security and code quality issues, then posts the findings
+as a real review on the PR (not just a local report).
+
+It's invoked on demand, not a persistent webhook listener: each run sweeps
+open PRs, skips ones it already reviewed at the current head commit, and
+posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest. For
+continuous coverage, re-run it on a schedule via the `schedule`/cron skill.
+
+What it checks:
+
+- Security: injection, hardcoded secrets, broken auth/authorization, unsafe
+  deserialization, SSRF/path traversal, weak crypto, risky dependency bumps,
+  leaky logging, loosened CORS/TLS/CSRF.
+- Quality: missing tests, unhandled error paths, dead code, logic bugs,
+  resource leaks, and consistency with the repo's existing conventions.
+
+Invoke it by asking Claude Code to review PRs, or explicitly:
+
+```
+> use the pr-reviewer agent to sweep robertncl's open PRs
+> use the pr-reviewer agent on robertncl/some-repo#42
+```
+
 ## dependency-updater
 
 Reviews a git repository and updates dependencies and GitHub Actions to the
