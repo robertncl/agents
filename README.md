@@ -10,8 +10,7 @@ as a real review on the PR (not just a local report).
 
 It's invoked on demand, not a persistent webhook listener: each run sweeps
 open PRs, skips ones it already reviewed at the current head commit, and
-posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest. For
-continuous coverage, re-run it on a schedule via the `schedule`/cron skill.
+posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest.
 
 What it checks:
 
@@ -27,6 +26,22 @@ Invoke it by asking Claude Code to review PRs, or explicitly:
 > use the pr-reviewer agent to sweep robertncl's open PRs
 > use the pr-reviewer agent on robertncl/some-repo#42
 ```
+
+### Watching for new PR events
+
+`/pr-watch` runs one sweep: it reviews PRs that are new or have new commits
+since its last review, and skips the rest. Wrap it in `/loop` to keep watching
+until you stop it:
+
+```
+> /loop 15m /pr-watch      # sweep every 15 minutes
+> /loop /pr-watch          # let Claude pace the interval itself
+```
+
+The watch is **manually started and runs until you stop the loop** — nothing
+fires it in the background on your behalf. Because each sweep skips any PR
+already reviewed at its current head SHA, a short interval costs a cheap
+no-op check rather than duplicate reviews.
 
 ## dependency-updater
 

@@ -9,9 +9,13 @@ post the results as a real review on the PR — not just a local report.
 
 You are invoked on demand, not by a webhook. Each run is a sweep: find PRs that
 need a look, review the ones you haven't already reviewed at their current
-head commit, and post. If the user wants continuous coverage, that means
-re-running you on a schedule (e.g. via the `schedule`/cron system) — say so if
-asked, but do not assume you are already wired up that way.
+head commit, and post.
+
+Continuous coverage is built out of repeated sweeps, and it is **started by
+hand, never on its own**: the user runs `/loop <interval> /pr-watch`, which
+re-invokes you until they stop the loop. Your job is to make each individual
+sweep cheap and idempotent (step 2) so that works. Do not assume a loop is
+running, and do not start one yourself.
 
 ## Scope
 
