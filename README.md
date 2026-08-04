@@ -39,6 +39,10 @@ within hours of publication. Refusing to adopt anything younger than a day
 removes the window the attacker is counting on, at the cost of being one day
 behind latest.
 
+It discovers every manifest in the tree in one pass, resolves all dependencies
+concurrently, and **opens a PR when there is anything to update** (it never
+merges — a human approves supply-chain changes).
+
 What it does:
 
 - Pins every GitHub Action to a full 40-char commit SHA with the tag in a
@@ -59,18 +63,35 @@ Invoke it by asking Claude Code to update dependencies in a repo, or explicitly:
 The version resolver the agent relies on. Usable standalone and in CI:
 
 ```bash
-# newest version at least 24h old
+# whole repo in one pass: every manifest + every workflow `uses:`
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json
+
+# just the inventory, one `ecosystem:name@current` spec per line
+scripts/cooloff.py scan-deps --dir .
+
+# single lookups
 scripts/cooloff.py pkg -e npm -n react -c 18.2.0 --json
 scripts/cooloff.py pkg -e pypi -n requests
-
-# newest action release at least 24h old, resolved to a commit SHA
 scripts/cooloff.py action actions/checkout@v4 --json
 
 # audit pin state of every `uses:` in .github/workflows (exit 2 if unpinned)
 scripts/cooloff.py scan-actions --dir .
 ```
 
-Ecosystems: `npm`, `pypi`, `crates`, `rubygems`, `go`, `maven`, `nuget`.
+`scan-deps` reads `package.json`, `requirements*.txt`, `pyproject.toml`
+(PEP 621 and Poetry), `Cargo.toml`, `go.mod`, `Gemfile`, `*.csproj`/`*.fsproj`,
+and `pom.xml`, skipping vendored trees, and deduplicates packages that appear
+in more than one manifest. Anything it can't parse — a Maven `${property}`
+version, or a TOML manifest on Python 3.10 without `tomllib` — is reported as a
+`note:` on stderr rather than silently dropped.
+
+`batch` resolves specs concurrently (`-j`, default 8) behind a shared response
+cache, and labels each row `update`, `current`, `resolved` (nothing pinned to
+compare against), `held_back` (newer version still inside the window), or
+`error`. It exits 3 if any row errored — the other rows still resolved.
+
+Ecosystems: `npm`, `pypi`, `crates`, `rubygems`, `go`, `maven`, `nuget`, plus
+`action:` specs in batch input.
 
 Flags: `--hours N` (window, or `$COOLOFF_HOURS`), `--same-major` (no major
 bumps), `--allow-prerelease` (off by default), `--json`.
