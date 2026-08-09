@@ -2,6 +2,52 @@
 
 Claude Code subagents and supporting tooling.
 
+| Agent | Does | Writes to your repo? |
+| --- | --- | --- |
+| [`dependabot-fixer`](#dependabot-fixer) | Turns open Dependabot alerts into one fix PR per vulnerability | Branches + PRs (never merges) |
+| [`dependency-updater`](#dependency-updater) | Routine dependency/Action upgrades past a 24h cooloff | Local commits only (no push unless asked) |
+| [`pr-reviewer`](#pr-reviewer) | Reviews open PRs for security + quality, posts a real GitHub review | Review comments only |
+
+## Usage
+
+The agents live in `.claude/agents/`, so they're available to Claude Code
+whenever you're working in this repo. To use them anywhere, copy them to your
+personal agent directory:
+
+```bash
+cp .claude/agents/*.md ~/.claude/agents/
+```
+
+Claude Code loads agents at session start — restart (or start a new session)
+after adding one. Then just describe the task and Claude picks the agent, or
+name it explicitly:
+
+```
+> use the dependabot-fixer agent on robertncl/my-service
+> use the dependency-updater agent on ~/code/my-service
+> use the pr-reviewer agent to sweep robertncl's open PRs
+```
+
+They compose into one security-maintenance pass over a repo:
+
+```
+> use the dependabot-fixer agent on ~/code/my-service to clear the open alerts
+> now use the dependency-updater agent on ~/code/my-service for everything else
+> then use the pr-reviewer agent on robertncl/my-service to review what landed
+```
+
+That order matters: fix the known CVEs first as isolated PRs, do the routine
+sweep second so it doesn't bundle security fixes into an unrelated diff, and
+review last. All three share the same cooloff rule, so nothing published in the
+last 24 hours enters the repo along the way.
+
+For recurring coverage, wrap any of them in the `schedule`/cron skill — none of
+them is a persistent watcher, so each run is a fresh sweep:
+
+```
+> /schedule every weekday at 9am: use the dependabot-fixer agent on robertncl/my-service
+```
+
 ## pr-reviewer
 
 Reviews open GitHub pull requests — by default every repo owned by
@@ -26,7 +72,12 @@ Invoke it by asking Claude Code to review PRs, or explicitly:
 ```
 > use the pr-reviewer agent to sweep robertncl's open PRs
 > use the pr-reviewer agent on robertncl/some-repo#42
+> use the pr-reviewer agent on this repo's open PRs, security findings only
+> review PR 4 with the pr-reviewer agent and focus on the auth changes
 ```
+
+Naming a specific repo or PR keeps it scoped there — it won't silently expand
+to every repo you own.
 
 ## dependabot-fixer
 
@@ -58,7 +109,13 @@ access or `security_events` scope.
 
 ```
 > use the dependabot-fixer agent on robertncl/my-service
+> use the dependabot-fixer agent on this repo, critical and high alerts only
+> use the dependabot-fixer agent on ~/code/my-service but just report — no PRs yet
+> the lodash patch is 6h old and actively exploited; rerun dependabot-fixer with --hours 1
 ```
+
+That last one is the only way a sub-cooloff version gets adopted: the agent
+holds it and hands you the tradeoff, and you decide.
 
 ## dependency-updater
 
@@ -84,7 +141,14 @@ Invoke it by asking Claude Code to update dependencies in a repo, or explicitly:
 
 ```
 > use the dependency-updater agent on ~/code/my-service
+> use the dependency-updater agent on https://github.com/robertncl/my-service
+> use the dependency-updater agent on this repo, patches and minors only
+> use the dependency-updater agent to pin the GitHub Actions in .github/workflows
 ```
+
+It commits locally and stops there — it won't push or open a PR unless you ask.
+Don't point it at a fork of someone else's repo; dependency drift there should
+track upstream.
 
 ### scripts/cooloff.py
 
