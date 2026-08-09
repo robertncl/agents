@@ -106,6 +106,12 @@ Alerts come from `gh api /repos/{owner}/{repo}/dependabot/alerts` (they aren't
 exposed via the GitHub MCP tools). Alerts on the same package are grouped into
 a single PR; work is ordered critical → high → medium → low.
 
+The alert list is fed straight into `cooloff.py batch`, so every fix version —
+packages and vulnerable Actions alike — resolves in one concurrent pass before
+any branch is created. That means the full shape of the run (how many PRs, what
+is held back, what has no fix) is known up front rather than discovered one
+package at a time.
+
 What it does:
 
 - Treats `first_patched_version` as a floor, then resolves the newest version

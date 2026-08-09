@@ -35,15 +35,49 @@ gh api --paginate /repos/{owner}/{repo}/dependabot/alerts -f state=open \
 ```
 
 Version resolution is `scripts/cooloff.py` from this repo (invoke by absolute
-path when working in another checkout — do not reimplement it inline):
+path when working in another checkout — do not reimplement it inline).
+
+**Resolve every alert in one pass. Do not loop over packages one at a time** —
+that is one process launch and one serial round trip per alert, and a repo with
+thirty alerts spends more time launching processes than fixing anything. The
+alert list *is* your inventory (`scan-deps` would miss the transitive packages
+most alerts fire on), so build batch specs from the alerts and pipe them in:
 
 ```bash
-scripts/cooloff.py pkg -e npm -n lodash -c 4.17.20 --json   # newest ≥24h-old version
-scripts/cooloff.py action actions/checkout@v4 --json        # tag → commit SHA
+# one spec per alert group: ecosystem:name@current-version
+printf 'npm:lodash@4.17.20\npypi:requests@2.28.0\naction:actions/checkout@v4\n' \
+  | scripts/cooloff.py batch - --json
 ```
 
-`first_patched_version` from the alert is a **floor**, not the answer. The
-answer is the newest version at or above that floor that clears the cooloff.
+The current version comes from the manifest or lockfile — Dependabot's alert
+payload does not carry the installed version. If you genuinely cannot determine
+it, omit `@current`; the row comes back `resolved` (target known, nothing to
+compare against) instead of `update`.
+
+**Dependabot's ecosystem names are not cooloff.py's.** Map them or every row
+comes back `error`:
+
+| Dependabot | cooloff.py |
+| --- | --- |
+| `pip` | `pypi` |
+| `rust` | `crates` |
+| `actions` | `action:` spec |
+| `npm`, `maven`, `nuget`, `rubygems`, `go` | unchanged |
+
+`composer`, `swift`, and `pub` are unsupported — resolve those by hand against
+the advisory and say in the report that they skipped the cooloff check.
+
+Each row comes back with a `status`: `update` (a newer version cleared the
+window — your work list), `current`, `resolved`, `held_back` (newer version
+exists but is inside the window — **not an error**, carry it into the report),
+or `error`. Batch exits 3 if any row errored while every other row still
+resolved, so read the output rather than reacting to the exit code. Single
+lookups (`pkg`, `action`) remain for spot checks and for anything batch could
+not resolve.
+
+`first_patched_version` from the alert is a **floor**, not the answer, and
+`batch` does not know about it — it returns the newest version that cleared the
+window. You compare the two yourself: see step 4.
 
 ## Procedure
 
@@ -79,17 +113,30 @@ gh pr list --repo <owner>/<repo> --state open --json number,title,headRefName,au
 - If a branch matching your naming scheme already exists on the remote, skip it.
   This is what makes re-running you idempotent instead of PR spam.
 
-**4. Resolve the fix version.** For each work item, run `cooloff.py pkg` with
-`-c <current version>` and take the newest result at or above
-`first_patched_version`. Then:
+**4. Resolve every fix version, once, up front.** Build one spec per surviving
+work item and resolve them all in a single `batch` call before you touch a
+branch. Doing this up front — rather than package by package inside the fix
+loop — also means you know the full shape of the run (how many PRs, what is
+held back, what has no fix) before you open the first PR.
 
+Then compare each row's `target` against that alert's `first_patched_version`:
+
+- **`target` ≥ floor:** that is your fix version. Note that it is often *above*
+  the floor — take it; a fix release plus later patches is better than the
+  minimum patched version, and it is the same version `dependency-updater`
+  would land anyway.
+- **`target` < floor, or `status: held_back` with the patched version in
+  `skipped_too_new`:** the patch itself has not cleared the window. Do not
+  bypass it on your own initiative. Report the tradeoff explicitly — severity
+  and exploit status of the CVE versus adopting an unvetted publish — with the
+  age in hours from `skipped_too_new`, and let the user decide. Only lower
+  `--hours` when they ask.
+- **`status: error`:** resolve that one by hand with `pkg`/`action` and report
+  what failed. A row that errored is not a row you may skip silently — it is an
+  unfixed vulnerability.
 - **No patched version exists** (`first_patched_version` is null): no PR. Report
   the alert, the advisory, and — if there is one — the documented workaround or
   a maintained replacement package. Do not invent a version number.
-- **The patch is younger than the cooloff:** do not bypass it on your own
-  initiative. Report the tradeoff explicitly — severity and exploit status of
-  the CVE versus adopting an unvetted publish — with the age in hours, and let
-  the user decide. Only lower `--hours` when they ask.
 - **The patch is a major version bump:** still do it, but flag it loudly in the
   report and the PR body, check the changelog for breaking changes, and never
   bundle it with other fixes.
@@ -108,14 +155,24 @@ package you do not depend on directly. In order of preference:
 
 Always commit the regenerated lockfile (`package-lock.json`, `pnpm-lock.yaml`,
 `poetry.lock`, `uv.lock`, `Cargo.lock`, `Gemfile.lock`, `go.sum`) — that is what
-actually pins the transitive tree. Then diff the lockfile and spot-check
-**newly added or bumped** entries against the cooloff too; a security bump that
-drags in a brand-new sub-dependency has reopened the door you just closed.
+actually pins the transitive tree. Then diff the lockfile, turn **newly added or
+bumped** entries into specs, and check them in one `batch` call — a security bump
+that drags in a brand-new sub-dependency has reopened the door you just closed:
 
-**6. Vulnerable GitHub Actions** (`ecosystem: "actions"`): resolve with
-`cooloff.py action` and rewrite as a full 40-char SHA with the tag in a trailing
-comment — `uses: actions/checkout@8f4b7f84... # v5.0.1`. Never leave a floating
-tag behind as the "fix"; a mutable tag is the vulnerability.
+```bash
+git diff <default-branch> -- package-lock.json \
+  | <extract added/bumped name@version> \
+  | scripts/cooloff.py batch - --json
+```
+
+Anything coming back `held_back` here is a fresh publish that arrived as a side
+effect of your fix — say so in the PR body.
+
+**6. Vulnerable GitHub Actions** (`ecosystem: "actions"`): these resolve in the
+same batch as everything else, as `action:owner/repo@current` specs — the row
+carries both `tag` and `sha`. Rewrite as a full 40-char SHA with the tag in a
+trailing comment — `uses: actions/checkout@8f4b7f84... # v5.0.1`. Never leave a
+floating tag behind as the "fix"; a mutable tag is the vulnerability.
 
 **7. One fix, one branch, one PR.** For each work item, in order:
 
@@ -150,8 +207,9 @@ previous fix branch, is what keeps the PRs independently mergeable. Then:
   or commit someone else's in-progress work.
 
 **8. Report.** A table of every alert: severity, package, current → fixed,
-publication age, PR link, and status (`PR opened`, `draft — tests failing`,
-`skipped — Dependabot PR #N`, `held — patch 6h old`, `no fix available`). The
+publication age (`age_hours` from the batch row), PR link, and status
+(`PR opened`, `draft — tests failing`, `skipped — Dependabot PR #N`,
+`held — patch 6h old`, `no fix available`, `resolve failed`). The
 **not-fixed rows are the most important part** — they are what the user still
 has to decide about. Finish with the count of alerts that remain open and
 unaddressed.
