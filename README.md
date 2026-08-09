@@ -28,6 +28,38 @@ Invoke it by asking Claude Code to review PRs, or explicitly:
 > use the pr-reviewer agent on robertncl/some-repo#42
 ```
 
+## dependabot-fixer
+
+Processes a repository's open Dependabot security alerts and lands **one
+branch, commit, and pull request per vulnerability**, so each fix can be
+reviewed, merged, or reverted on its own.
+
+Alerts come from `gh api /repos/{owner}/{repo}/dependabot/alerts` (they aren't
+exposed via the GitHub MCP tools). Alerts on the same package are grouped into
+a single PR; work is ordered critical → high → medium → low.
+
+What it does:
+
+- Treats `first_patched_version` as a floor, then resolves the newest version
+  above it that clears the same 24h cooloff window as `dependency-updater` —
+  a CVE patch published minutes ago gets held back and surfaced as a tradeoff,
+  not adopted silently.
+- Prefers fixing transitive alerts by bumping the direct parent dependency;
+  `overrides`/`resolutions` are a last-resort stopgap and get labelled as one.
+- Re-checks the regenerated lockfile's newly added transitive entries against
+  the cooloff, and pins vulnerable GitHub Actions to full commit SHAs.
+- Skips packages Dependabot already has an open PR for, and branches every fix
+  off a fresh default branch so the PRs stay independently mergeable.
+- Never merges, auto-merges, or dismisses an alert; opens a draft PR (flagged)
+  when the test suite fails after a bump.
+
+Skipped by design: forks, archived repos, and repos where the token lacks write
+access or `security_events` scope.
+
+```
+> use the dependabot-fixer agent on robertncl/my-service
+```
+
 ## dependency-updater
 
 Reviews a git repository and updates dependencies and GitHub Actions to the
