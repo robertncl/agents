@@ -10,8 +10,7 @@ as a real review on the PR (not just a local report).
 
 It's invoked on demand, not a persistent webhook listener: each run sweeps
 open PRs, skips ones it already reviewed at the current head commit, and
-posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest. For
-continuous coverage, re-run it on a schedule via the `schedule`/cron skill.
+posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest.
 
 What it checks:
 
@@ -28,37 +27,21 @@ Invoke it by asking Claude Code to review PRs, or explicitly:
 > use the pr-reviewer agent on robertncl/some-repo#42
 ```
 
-## dependabot-fixer
+### Watching for new PR events
 
-Processes a repository's open Dependabot security alerts and lands **one
-branch, commit, and pull request per vulnerability**, so each fix can be
-reviewed, merged, or reverted on its own.
-
-Alerts come from `gh api /repos/{owner}/{repo}/dependabot/alerts` (they aren't
-exposed via the GitHub MCP tools). Alerts on the same package are grouped into
-a single PR; work is ordered critical → high → medium → low.
-
-What it does:
-
-- Treats `first_patched_version` as a floor, then resolves the newest version
-  above it that clears the same 24h cooloff window as `dependency-updater` —
-  a CVE patch published minutes ago gets held back and surfaced as a tradeoff,
-  not adopted silently.
-- Prefers fixing transitive alerts by bumping the direct parent dependency;
-  `overrides`/`resolutions` are a last-resort stopgap and get labelled as one.
-- Re-checks the regenerated lockfile's newly added transitive entries against
-  the cooloff, and pins vulnerable GitHub Actions to full commit SHAs.
-- Skips packages Dependabot already has an open PR for, and branches every fix
-  off a fresh default branch so the PRs stay independently mergeable.
-- Never merges, auto-merges, or dismisses an alert; opens a draft PR (flagged)
-  when the test suite fails after a bump.
-
-Skipped by design: forks, archived repos, and repos where the token lacks write
-access or `security_events` scope.
+`/pr-watch` runs one sweep: it reviews PRs that are new or have new commits
+since its last review, and skips the rest. Wrap it in `/loop` to keep watching
+until you stop it:
 
 ```
-> use the dependabot-fixer agent on robertncl/my-service
+> /loop 15m /pr-watch      # sweep every 15 minutes
+> /loop /pr-watch          # let Claude pace the interval itself
 ```
+
+The watch is **manually started and runs until you stop the loop** — nothing
+fires it in the background on your behalf. Because each sweep skips any PR
+already reviewed at its current head SHA, a short interval costs a cheap
+no-op check rather than duplicate reviews.
 
 ## dependency-updater
 
@@ -70,6 +53,10 @@ maintainer account, hijacked action tag, typosquat) are detected and yanked
 within hours of publication. Refusing to adopt anything younger than a day
 removes the window the attacker is counting on, at the cost of being one day
 behind latest.
+
+It discovers every manifest in the tree in one pass, resolves all dependencies
+concurrently, and **opens a PR when there is anything to update** (it never
+merges — a human approves supply-chain changes).
 
 What it does:
 
@@ -91,18 +78,35 @@ Invoke it by asking Claude Code to update dependencies in a repo, or explicitly:
 The version resolver the agent relies on. Usable standalone and in CI:
 
 ```bash
-# newest version at least 24h old
+# whole repo in one pass: every manifest + every workflow `uses:`
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json
+
+# just the inventory, one `ecosystem:name@current` spec per line
+scripts/cooloff.py scan-deps --dir .
+
+# single lookups
 scripts/cooloff.py pkg -e npm -n react -c 18.2.0 --json
 scripts/cooloff.py pkg -e pypi -n requests
-
-# newest action release at least 24h old, resolved to a commit SHA
 scripts/cooloff.py action actions/checkout@v4 --json
 
 # audit pin state of every `uses:` in .github/workflows (exit 2 if unpinned)
 scripts/cooloff.py scan-actions --dir .
 ```
 
-Ecosystems: `npm`, `pypi`, `crates`, `rubygems`, `go`, `maven`, `nuget`.
+`scan-deps` reads `package.json`, `requirements*.txt`, `pyproject.toml`
+(PEP 621 and Poetry), `Cargo.toml`, `go.mod`, `Gemfile`, `*.csproj`/`*.fsproj`,
+and `pom.xml`, skipping vendored trees, and deduplicates packages that appear
+in more than one manifest. Anything it can't parse — a Maven `${property}`
+version, or a TOML manifest on Python 3.10 without `tomllib` — is reported as a
+`note:` on stderr rather than silently dropped.
+
+`batch` resolves specs concurrently (`-j`, default 8) behind a shared response
+cache, and labels each row `update`, `current`, `resolved` (nothing pinned to
+compare against), `held_back` (newer version still inside the window), or
+`error`. It exits 3 if any row errored — the other rows still resolved.
+
+Ecosystems: `npm`, `pypi`, `crates`, `rubygems`, `go`, `maven`, `nuget`, plus
+`action:` specs in batch input.
 
 Flags: `--hours N` (window, or `$COOLOFF_HOURS`), `--same-major` (no major
 bumps), `--allow-prerelease` (off by default), `--json`.
