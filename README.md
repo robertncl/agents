@@ -8,6 +8,27 @@ Claude Code subagents and supporting tooling.
 | [`dependency-updater`](#dependency-updater) | Routine dependency/Action upgrades past a 24h cooloff | Branch + PR when there's anything to update (never merges) |
 | [`pr-reviewer`](#pr-reviewer) | Reviews open PRs for security + quality, posts a real GitHub review | Review comments only |
 
+The two dependency agents are pinned to `model: haiku` — their procedures are
+written as fixed command sequences and decision tables, so a small model can run
+them without improvising. `pr-reviewer` is pinned to `model: sonnet`: steps 4
+and 5 are genuine security judgment rather than procedure, and a small model
+there both misses subtle findings and raises more false positives.
+
+## Sweep scope
+
+With no repo named, all three sweep exactly the repos listed in
+[`.claude/targets.txt`](.claude/targets.txt) — never every repo the account
+owns. A repo earns a line there only if it is **not a fork**, not archived,
+write-accessible, and a **previous sweep actually found something to fix**
+(the evidence PR is in the trailing comment).
+
+Naming a repo explicitly (`path`, `owner/repo`, or clone URL) bypasses the list
+and targets just that repo. The fork/archive/permission guard still runs either
+way — a fork is always skipped, listed or not.
+
+To add a repo, verify all four conditions and append it with its evidence PR.
+Adding speculative targets costs a full clone-and-resolve pass for nothing.
+
 ## Usage
 
 The agents live in `.claude/agents/`, so they're available to Claude Code
@@ -52,9 +73,10 @@ side ([below](#watching-for-new-pr-events)); for the other two, use the
 
 ## pr-reviewer
 
-Reviews open GitHub pull requests — by default every repo owned by
-`robertncl` — for security and code quality issues, then posts the findings
-as a real review on the PR (not just a local report).
+Reviews open GitHub pull requests — by default the repos in
+[`.claude/targets.txt`](.claude/targets.txt) — for security and code quality
+issues, then posts the findings as a real review on the PR (not just a local
+report). Sweeping every repo the account owns is opt-in, by asking for it.
 
 It's invoked on demand, not a persistent webhook listener: each run sweeps
 open PRs, skips ones it already reviewed at the current head commit, and
@@ -173,8 +195,9 @@ Invoke it by asking Claude Code to update dependencies in a repo, or explicitly:
 > use the dependency-updater agent to pin the GitHub Actions in .github/workflows
 ```
 
-Don't point it at a fork of someone else's repo — dependency drift on a fork
-should track upstream rather than being pushed independently.
+Forks are refused, not just discouraged — the agent checks `isFork` before
+touching anything and skips, because dependency drift on a fork should track
+upstream rather than being pushed independently.
 
 ### scripts/cooloff.py
 

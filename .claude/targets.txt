@@ -1,0 +1,28 @@
+# Sweep scope for dependency-updater and dependabot-fixer.
+#
+# One repo per line, `owner/repo`. Blank lines and `#` comments ignored.
+#
+# Membership rule: a repo belongs here only if ALL of these hold.
+#   1. Not a fork of another public repo.
+#   2. Not archived.
+#   3. Write (or better) permission for the token running the sweep.
+#   4. A previous sweep actually found dependencies or vulnerabilities to fix
+#      -- evidenced by a merged/closed dependency or security PR.
+#
+# Verified 2026-08-14 against `gh repo view` (isFork/isArchived/viewerPermission)
+# and `gh search prs --owner robertncl`. Re-verify before adding a line.
+#
+# To add a repo: prove all four conditions above, then append it with the
+# evidence PR in the trailing comment. Do not add a repo speculatively --
+# an unproven target costs a full clone-and-resolve pass for nothing.
+
+robertncl/angular              # PR #33-#37 (5 CVE overrides), #41 (8 deps, cooloff)
+robertncl/crypto               # PR #27, #43 (deps + Actions pinning)
+robertncl/crypto-bot           # PR #9, #10 (cryptography, aiohttp advisories)
+robertncl/expense              # PR #2-#9 (8 transitive CVE overrides)
+robertncl/hrms                 # PR #50, #63 (Actions re-pin, @hono/node-server CVE)
+robertncl/nextjs               # PR #1 (deps + Actions pinned to SHA)
+robertncl/pokedev              # PR #3, #4 (uuid, shell-quote CVEs)
+robertncl/vue-demo             # PR #56, #58 (cooloff bumps, undici x5 alerts)
+robertncl/Hello-world-action   # PR #4 (docker/setup-buildx-action bump)
+robertncl/bun-app              # PR #7 (bun runtime bump)
