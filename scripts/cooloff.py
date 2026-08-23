@@ -192,9 +192,20 @@ def versions_npm(name: str):
     url = f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}"
     data = fetch_json(url)
     times = data.get("time", {})
+    versions_meta = data.get("versions") or {}
+    # A package can carry a blanket deprecation notice on every version (e.g.
+    # a soft "use the new package name" migration notice) rather than a
+    # per-version "this release is broken" warning. Filtering those out
+    # entirely would silently steer resolution toward a stale, older release
+    # instead of the actual latest -- a downgrade, not a safety measure. Only
+    # treat `deprecated` as exclusionary when it's marking specific versions
+    # as bad against a backdrop of non-deprecated ones.
+    all_deprecated = bool(versions_meta) and all(
+        isinstance(meta, dict) and meta.get("deprecated") for meta in versions_meta.values()
+    )
     out = []
-    for ver, meta in (data.get("versions") or {}).items():
-        if isinstance(meta, dict) and meta.get("deprecated"):
+    for ver, meta in versions_meta.items():
+        if not all_deprecated and isinstance(meta, dict) and meta.get("deprecated"):
             continue
         ts = parse_ts(times.get(ver, ""))
         if ts:
@@ -455,7 +466,11 @@ def resolve_action(ref, hours, allow_prerelease=False, same_major_only=False, ma
             "age_hours": round(age, 2),
             "cooloff_hours": hours,
             "uses": f"{ref.split('@')[0]}@{sha} # {tag}",
-            "changed": current != sha,
+            # `current` is a tag (either the unpinned ref, or the tag comment
+            # scan-deps recovers for an already-pinned action) -- compare it
+            # against the resolved tag, not the resolved SHA, or an
+            # already-current pin always looks "changed".
+            "changed": current != tag,
             "skipped_too_new": skipped,
         }
     raise ResolveError(
