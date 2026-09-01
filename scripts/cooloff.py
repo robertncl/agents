@@ -203,9 +203,25 @@ def versions_npm(name: str):
     all_deprecated = bool(versions_meta) and all(
         isinstance(meta, dict) and meta.get("deprecated") for meta in versions_meta.values()
     )
+    # A narrower version of the same trap: a maintainer can also deprecate a
+    # package wholesale starting at its current major ("use @angular/build
+    # instead") without retroactively flagging older majors. That leaves the
+    # newest major all-deprecated while history isn't, so the check above
+    # never fires -- and per-version filtering then walks straight past the
+    # deprecation boundary into a stale, no-longer-maintained major. Extend
+    # the same escape hatch to "every version of the newest major present".
+    stable_majors = [major_of(v) for v in versions_meta if parse_version(v) is not None and is_stable(v)]
+    newest_major = max(stable_majors) if stable_majors else None
+    newest_major_all_deprecated = newest_major is not None and all(
+        isinstance(meta, dict) and meta.get("deprecated")
+        for ver, meta in versions_meta.items()
+        if major_of(ver) == newest_major and is_stable(ver)
+    )
     out = []
     for ver, meta in versions_meta.items():
-        if not all_deprecated and isinstance(meta, dict) and meta.get("deprecated"):
+        deprecated = isinstance(meta, dict) and meta.get("deprecated")
+        protected = all_deprecated or (newest_major_all_deprecated and major_of(ver) == newest_major)
+        if deprecated and not protected:
             continue
         ts = parse_ts(times.get(ver, ""))
         if ts:
