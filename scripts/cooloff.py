@@ -34,6 +34,24 @@ UA = "cooloff-dependency-updater/1.0 (+https://github.com/robertncl/agents)"
 DEFAULT_HOURS = 24
 ECOSYSTEMS = ("npm", "pypi", "crates", "rubygems", "go", "maven", "nuget")
 
+# Packages whose newest major clears the cooloff window fine but is known to
+# break the toolchain that consumes it -- the registry has no way to signal
+# that, so it has to be held here by hand. Keyed "ecosystem:name" -> highest
+# major version still safe to propose. Remove the entry once the blocking
+# tool ships support for the newer major.
+VERSION_CEILING = {
+    # @angular-devkit/build-angular (through at least 22.1.7) pins a
+    # peerDependency of typescript ">=6.0 <6.1", and vue-tsc 3.3.11 (latest)
+    # throws ERR_PACKAGE_PATH_NOT_EXPORTED against TS7's restructured
+    # ./lib/tsc export -- confirmed breaking angular#55 and vue-demo#74 on
+    # 2026-09-04.
+    "npm:typescript": 6,
+    # zone.js's jasmine-patch breaks under jasmine-core 7 ("Cannot assign to
+    # read only property 'describe'") -- confirmed breaking hrms#73 on
+    # 2026-09-04.
+    "npm:jasmine-core": 6,
+}
+
 
 # --------------------------------------------------------------------------
 # version comparison
@@ -340,7 +358,7 @@ FETCHERS = {
 # --------------------------------------------------------------------------
 
 
-def select(candidates, hours, allow_prerelease, same_major_as=None):
+def select(candidates, hours, allow_prerelease, same_major_as=None, max_major=None):
     """Newest candidate clearing the cooloff. Returns (chosen, skipped, considered)."""
     considered = []
     for ver, ts in candidates:
@@ -349,6 +367,8 @@ def select(candidates, hours, allow_prerelease, same_major_as=None):
         if not allow_prerelease and not is_stable(ver):
             continue
         if same_major_as is not None and major_of(ver) != same_major_as:
+            continue
+        if max_major is not None and (major_of(ver) or 0) > max_major:
             continue
         considered.append((ver, ts))
     considered.sort(key=lambda p: sort_key(p[0]), reverse=True)
@@ -595,7 +615,8 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
         raise ResolveError(f"no published versions found for {ecosystem}:{name}")
 
     same_major = major_of(current) if same_major_only and current else None
-    chosen, skipped, considered = select(candidates, hours, allow_prerelease, same_major)
+    max_major = VERSION_CEILING.get(f"{ecosystem}:{name}")
+    chosen, skipped, considered = select(candidates, hours, allow_prerelease, same_major, max_major)
     if not chosen:
         head = ", ".join(s["version"] for s in skipped[:5]) or "none"
         more = f" (+{len(skipped) - 5} older)" if len(skipped) > 5 else ""
