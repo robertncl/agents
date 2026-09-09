@@ -714,6 +714,16 @@ def _deps_package_json(path, root, out, notes):
 
 
 def _deps_requirements(path, root, out, notes):
+    # For pip-compile projects, requirements.txt is auto-generated with all transitive
+    # dependencies. If a requirements.in source exists, scan that instead so we only
+    # resolve direct dependencies; pip-compile will handle transitive ones. If no .in
+    # exists, fall back to the .txt file (e.g., non-compiled pip requirements).
+    if path.endswith(".txt"):
+        # Check if a corresponding .in file exists in the same directory
+        in_path = path[:-4] + ".in"
+        if os.path.exists(in_path):
+            path = in_path  # Scan the .in file instead of the .txt
+
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.split("#", 1)[0].strip()
