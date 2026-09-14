@@ -39,7 +39,7 @@ gh repo view <owner>/<repo> --json isFork,isArchived,viewerPermission,defaultBra
 | `isArchived: true` | Stop. Skip. |
 | `viewerPermission` not WRITE/MAINTAIN/ADMIN | Stop. Skip — you cannot push a branch, and finding out after ten fixes wastes the run. |
 | Working tree dirty | Stop. Report. Never stash someone else's work. |
-| `dependabot/alerts` returns 403/404 | Alerts disabled or token lacks `security_events`. Say which, skip. **Never** substitute `npm audit` and call it "the Dependabot alerts." |
+| `dependabot/alerts` returns 403/404 | First re-check with a **plain GET** (see Tools — a `-f` flag makes `gh api` POST, which always 404s). Only if it still fails: confirm via `/vulnerability-alerts` whether alerts are disabled or the token lacks `security_events`, say which, skip. **Never** substitute `npm audit` and call it "the Dependabot alerts." |
 
 Report every skip and why.
 
@@ -48,7 +48,7 @@ Report every skip and why.
 Dependabot alerts are not exposed through the GitHub MCP tools — use `gh api`.
 
 ```bash
-gh api --paginate /repos/{owner}/{repo}/dependabot/alerts -f state=open \
+gh api --paginate --method GET /repos/{owner}/{repo}/dependabot/alerts -f state=open \
   --jq '.[] | {n:.number, sev:.security_advisory.severity, ghsa:.security_advisory.ghsa_id,
                cve:.security_advisory.cve_id, pkg:.security_vulnerability.package.name,
                eco:.security_vulnerability.package.ecosystem,
@@ -56,6 +56,20 @@ gh api --paginate /repos/{owner}/{repo}/dependabot/alerts -f state=open \
                fix:.security_vulnerability.first_patched_version.identifier,
                manifest:.dependency.manifest_path, scope:.dependency.scope}'
 ```
+
+`--method GET` is **not optional**. `gh api` switches to POST as soon as any
+`-f` field is present, and `POST /dependabot/alerts` returns a bare `404 Not
+Found`. That 404 is indistinguishable by eye from "alerts are disabled" or
+"token lacks `security_events`" — do not report either of those conclusions off
+a 404 alone. Confirm first:
+
+```bash
+gh api -i /repos/{owner}/{repo}/vulnerability-alerts   # 204 = alerts enabled
+gh api /repos/{owner}/{repo}/dependabot/alerts --jq 'length'   # no -f, plain GET
+```
+
+A repo with a long history of `fixed` alerts and zero `open` ones is the normal
+healthy outcome, and the correct report is "0 open alerts", not a blocker.
 
 Version resolution is `scripts/cooloff.py` from this repo (absolute path when
 working in another checkout — never reimplement it inline).
