@@ -147,6 +147,30 @@ def sort_key(raw: str):
     return (padded, stable, pre)
 
 
+_RANGE_OPS_RE = re.compile(r"^[\s^~><=!]+")
+
+
+def strip_range_ops(raw: str):
+    """Drop a leading range operator (^1.2.3, >=1.2.3) from a pin."""
+    return _RANGE_OPS_RE.sub("", raw.strip()) if raw else raw
+
+
+def same_version(a, b) -> bool:
+    """Version equality across ecosystems that spell the same version differently.
+
+    Go pins carry a `v` prefix and so do the versions the proxy returns, npm
+    pins carry range operators and its registry versions do not. Comparing the
+    raw strings made every Go module look permanently out of date. parse_version
+    already treats `v5.3.2` and `5.3.2` alike, so compare through it.
+    """
+    if a is None or b is None:
+        return False
+    ca, cb = strip_range_ops(a), strip_range_ops(b)
+    if parse_version(ca) is None or parse_version(cb) is None:
+        return ca == cb
+    return sort_key(ca) == sort_key(cb)
+
+
 def major_of(raw: str):
     parsed = parse_version(raw)
     return parsed[0][0] if parsed else None
@@ -794,7 +818,7 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
         "published": chosen["published"],
         "age_hours": chosen["age_hours"],
         "cooloff_hours": hours,
-        "changed": bool(current) and current.lstrip("^~>=<= v") != chosen["version"],
+        "changed": bool(current) and not same_version(current, chosen["version"]),
         "skipped_too_new": skipped,
         "versions_considered": len(considered),
         "ceiling": ceiling,
@@ -1080,7 +1104,7 @@ def _is_backwards(current, target):
     """True when `target` is strictly older than the pinned `current`."""
     if not current or not target:
         return False
-    cur = current.lstrip("^~>=<= v")
+    cur = strip_range_ops(current)
     if parse_version(cur) is None or parse_version(target) is None:
         return False
     return sort_key(target) < sort_key(cur)
