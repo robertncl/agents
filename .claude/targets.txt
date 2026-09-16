@@ -11,6 +11,19 @@
 #
 # Verified 2026-08-14 against `gh repo view` (isFork/isArchived/viewerPermission)
 # and `gh search prs --owner robertncl`. Re-verify before adding a line.
+# Six more verified 2026-09-16 the same way, prompted by a `~/code/*` sweep
+# request: every local checkout under ~/code was checked against all four
+# conditions before any of it was added here. Repos rejected in that pass and
+# why: PacktPublishing/LLM-Engineers-Handbook, bananalab/Learn-Infrastructure-
+# as-Code-with-Terraform, NVIDIA/OpenShell, ps-copilot-sandbox/copilot-
+# intermediate-gallery-repo, microsoft/generative-ai-for-beginners,
+# hashicorp-education/learn-hcp-packer-get-started -- not robertncl's repos.
+# robertncl/juice-shop -- origin 404s, repo renamed or deleted upstream.
+# robertncl/{DLS,Learning-resource,argocd,databricks,gitops-helm,
+# gitops-kustomize,learn-markdown,python,pytorch,test-agents-2} -- zero
+# dependency manifests in the tree, nothing a sweep could ever find.
+# robertncl/learn-crypto -- has a package.json but no prior sweep evidence
+# (condition 4); swept once as an explicit one-off instead of added here.
 #
 # To add a repo: prove all four conditions above, then append it with the
 # evidence PR in the trailing comment. Do not add a repo speculatively --
@@ -33,3 +46,9 @@ robertncl/gh-action-demo        # PR #1, #3-#5 (deps cooloff bumps)
 robertncl/payment               # PR #1, #3 (deps + Actions pinned to SHA)
 robertncl/multicloud            # PR #2, #3 (deps cooloff bumps)
 robertncl/closeclaw             # PR #3, #5, #7, #8 (npm deps cooloff bumps)
+robertncl/doom-clone             # PR #4 (Cargo deps cooloff bump)
+robertncl/flappy                 # PR #5-#7 (deps cooloff bumps)
+robertncl/sonatype               # PR #4 (helm chart deps cooloff bump)
+robertncl/test-agents            # PR #1 (deps cooloff bump)
+robertncl/WorldCup                # PR #1 (deps cooloff sweep)
+robertncl/learn-actions           # PR #14 (deps cooloff sweep)
