@@ -358,8 +358,26 @@ FETCHERS = {
 # --------------------------------------------------------------------------
 
 
-def select(candidates, hours, allow_prerelease, same_major_as=None, max_major=None):
+def select(candidates, hours, allow_prerelease, same_major_as=None, max_major=None, current=None):
     """Newest candidate clearing the cooloff. Returns (chosen, skipped, considered)."""
+    # A ceiling (max_major) is meant to cap how far forward a sweep will go,
+    # never to pull a package backward. If the registry's current release
+    # already cleared the ceiling -- npm:jasmine-core sitting on 7.0.2 against
+    # a ceiling of 6 -- filtering by max_major alone leaves only 6.x
+    # candidates, and the newest of those reads as a normal "update" target
+    # even though it is strictly older than what's installed. Exclude
+    # anything below `current` outright, the same way max_major excludes
+    # anything above the ceiling, so a ceiling can only hold a package where
+    # it is, never recommend a downgrade. Confirmed live in angular#82
+    # (2026-09-16): jasmine-core was only held back because the agent running
+    # the sweep noticed target < current by hand and wrote it up that way --
+    # cooloff.py itself would have returned 6.3.0 as `target` with
+    # `changed: true` and no held_back signal at all.
+    floor = None
+    if current is not None:
+        if parse_version(current) is not None:
+            floor = sort_key(current)
+
     considered = []
     for ver, ts in candidates:
         if parse_version(ver) is None:
@@ -367,6 +385,8 @@ def select(candidates, hours, allow_prerelease, same_major_as=None, max_major=No
         if not allow_prerelease and not is_stable(ver):
             continue
         if same_major_as is not None and major_of(ver) != same_major_as:
+            continue
+        if floor is not None and sort_key(ver) < floor:
             continue
         if max_major is not None and (major_of(ver) or 0) > max_major:
             continue
@@ -616,8 +636,19 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
 
     same_major = major_of(current) if same_major_only and current else None
     max_major = VERSION_CEILING.get(f"{ecosystem}:{name}")
-    chosen, skipped, considered = select(candidates, hours, allow_prerelease, same_major, max_major)
+    chosen, skipped, considered = select(candidates, hours, allow_prerelease, same_major, max_major, current)
     if not chosen:
+        current_major = major_of(current) if current else None
+        if max_major is not None and current_major is not None and current_major > max_major:
+            # Ceiling filtering left only versions older than what's already
+            # installed, and select() refuses to offer any of those as a
+            # target -- not a cooloff-timing gap, so don't describe it as one.
+            raise ResolveError(
+                f"{name}: already on {current} (major {current_major}), past the "
+                f"version ceiling of {max_major} -- nothing at or above current "
+                f"clears the ceiling, so there is no safe target",
+                held_back=skipped,
+            )
         head = ", ".join(s["version"] for s in skipped[:5]) or "none"
         more = f" (+{len(skipped) - 5} older)" if len(skipped) > 5 else ""
         raise ResolveError(
