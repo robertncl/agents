@@ -114,6 +114,35 @@ class TestCeilingScope(unittest.TestCase):
         self.assertIsNone(cooloff.ceiling_for("npm", "react", {"react"}))
 
 
+class TestVersionEquality(unittest.TestCase):
+    """Go pins carry a `v`; npm pins carry range operators. Neither is a change."""
+
+    def test_go_v_prefix_is_not_a_change(self):
+        # crypto's whole go.mod reported as "update v5.3.2 -> v5.3.2".
+        self.assertTrue(cooloff.same_version("v5.3.2", "v5.3.2"))
+        self.assertTrue(cooloff.same_version("v5.3.2", "5.3.2"))
+        self.assertTrue(cooloff.same_version("5.3.2", "v5.3.2"))
+
+    def test_range_operators_are_stripped(self):
+        self.assertTrue(cooloff.same_version("^19.3.0", "19.3.0"))
+        self.assertTrue(cooloff.same_version("~1.82.0", "1.82.0"))
+        self.assertTrue(cooloff.same_version(">=4.11.8", "4.11.8"))
+
+    def test_real_differences_still_register(self):
+        self.assertFalse(cooloff.same_version("v5.3.2", "v5.4.0"))
+        self.assertFalse(cooloff.same_version("^19.3.0", "19.4.0"))
+        self.assertFalse(cooloff.same_version("8.2.2", "8.3.0"))
+
+    def test_unparseable_falls_back_to_string_equality(self):
+        self.assertTrue(cooloff.same_version("main", "main"))
+        self.assertFalse(cooloff.same_version("main", "v1.0.0"))
+        self.assertFalse(cooloff.same_version(None, "1.0.0"))
+
+    def test_padding_does_not_collapse_distinct_versions(self):
+        self.assertTrue(cooloff.same_version("1.2", "1.2.0"))
+        self.assertFalse(cooloff.same_version("1.2", "1.2.1"))
+
+
 class TestBackwardsGuard(unittest.TestCase):
     def test_detects_downgrade(self):
         self.assertTrue(cooloff._is_backwards("7.0.2", "6.0.3"))
