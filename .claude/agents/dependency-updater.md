@@ -63,10 +63,17 @@ Each `batch` row carries a `status`:
 | `current` | Already on target | Nothing. |
 | `resolved` | No pinned version to compare | Decide whether to pin; report. |
 | `held_back` | Newer version inside the window | **Not an error.** Keep current, report hours short. |
+| `peer_held` | The bump violates a peerDependency range another package in the sweep declares | **Not an error.** `npm ci` would fail on it. Keep current, report the requirer and range from `peer_conflicts`. |
+| `above_ceiling` | The pin is newer than a `VERSION_CEILING` allows | **Never downgrade.** Keep the pin, report the ceiling's `reason`. |
+| `ahead` | The pin is newer than anything selectable, with no ceiling in play | Keep the pin. Usually a placeholder release (react-native's `1000.0.0`). |
 | `error` | 404 / bad spec / network | Retry with `pkg` or `action`, then report by hand. |
 
 `batch` exits 3 if any row errored, but every other row still resolved — read
 the output, don't react to the exit code.
+
+A row can also carry `peer_unverified` — a peer range the resolver could not
+parse (`workspace:*`, a git URL). It is not enforced. Check those by hand
+before trusting the bump.
 
 Flags: `--hours N` (window), `--same-major`, `--allow-prerelease` (off by
 default), `-j N` (concurrency, default 8). `$COOLOFF_HOURS` sets the default.
@@ -171,6 +178,12 @@ link, and list every repo skipped at the scope gate with the reason.
   transferred to a new owner: stop and report. Both are compromise signals.
 - Opening a PR is expected; merging is not. Never force-push, never commit to
   the default branch. Audit or dry run requested? Report only, skip step 6.
+- **This applies to every commit you make in a target repo, not just dependency
+  bumps.** Closing a Dependabot PR, adding a `dependabot.yml` ignore rule,
+  editing CI config, or any other administrative change still goes on a branch
+  with a PR — never a direct commit to the default branch, even for a one-line
+  config change that "obviously" needs no review. A human approves every
+  change that lands in a repo you don't own the default branch policy for.
 - Efficiency means fewer round trips, never fewer checks. Skipping a manifest,
   sampling a subset, or trusting a lockfile diff without resolving it is a gap
   in exactly the place this agent exists to cover.

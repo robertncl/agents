@@ -101,7 +101,8 @@ carry it. If you genuinely cannot determine it, omit `@current`; the row returns
 advisory and say in the report that they skipped the cooloff check.
 
 Row statuses: `update` (cleared the window — your work list), `current`,
-`resolved`, `held_back` (**not an error** — carry into the report), `error`.
+`resolved`, `held_back` (**not an error** — carry into the report), `peer_held` / `above_ceiling` / `ahead` (keep the current pin — see
+dependency-updater.md for what each means), `error`.
 `batch` exits 3 if any row errored while every other row resolved, so read the
 output rather than reacting to the exit code. `pkg` / `action` remain for spot
 checks and anything batch could not resolve.
