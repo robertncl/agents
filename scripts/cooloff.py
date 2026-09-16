@@ -52,9 +52,18 @@ VERSION_CEILING = {
         # (latest) throws ERR_PACKAGE_PATH_NOT_EXPORTED against TS7's
         # restructured ./lib/tsc export -- confirmed breaking angular#55 and
         # vue-demo#74 on 2026-09-04.
-        "when_present": ["@angular-devkit/build-angular", "vue-tsc"],
+        # eslint-config-next depends on typescript-eslint, which pins its own
+        # peerDependency of typescript ">=4.8.4 <6.1.0" -- so any Next.js repo
+        # hits the same wall even with no Angular or Vue tooling at all.
+        # Confirmed breaking nextjs's `npm run lint` (TypeError in
+        # typescript-eslint's internal Cjs handling) on 2026-09-16, caught
+        # only because the sweep still ran `npm run lint` after a build that
+        # passed clean.
+        "when_present": ["@angular-devkit/build-angular", "vue-tsc", "eslint-config-next"],
         "reason": "@angular-devkit/build-angular pins typescript >=6.0 <6.1; "
-                  "vue-tsc 3.3.11 fails on TS7's restructured ./lib/tsc export",
+                  "vue-tsc 3.3.11 fails on TS7's restructured ./lib/tsc export; "
+                  "typescript-eslint (via eslint-config-next) pins "
+                  "typescript >=4.8.4 <6.1.0",
     },
     "npm:jasmine-core": {
         "max_major": 6,

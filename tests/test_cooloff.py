@@ -105,6 +105,22 @@ class TestCeilingScope(unittest.TestCase):
         self.assertEqual(c["max_major"], 6)
         self.assertIn("@angular-devkit/build-angular", c["matched"])
 
+    def test_applies_for_next_js_via_eslint_config_next(self):
+        # nextjs: no Angular or Vue tooling at all, but eslint-config-next
+        # pulls in typescript-eslint, which pins its own peerDependency of
+        # typescript ">=4.8.4 <6.1.0". Confirmed breaking `npm run lint`
+        # with TS7 on 2026-09-16 even though `npm run build` passed clean.
+        c = cooloff.ceiling_for(
+            "npm", "typescript", {"typescript", "next", "eslint-config-next"})
+        self.assertTrue(c["applied"])
+        self.assertEqual(c["max_major"], 6)
+        self.assertIn("eslint-config-next", c["matched"])
+        # bun-app: plain typescript devDependency, no eslint-config-next and
+        # no Angular/Vue tooling -- the ceiling must not apply here.
+        c = cooloff.ceiling_for(
+            "npm", "typescript", {"typescript", "playwright", "bun"})
+        self.assertFalse(c["applied"])
+
     def test_no_context_assumes_the_ceiling(self):
         c = cooloff.ceiling_for("npm", "typescript", None)
         self.assertTrue(c["applied"])
