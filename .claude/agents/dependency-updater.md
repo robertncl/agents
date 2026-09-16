@@ -178,6 +178,12 @@ link, and list every repo skipped at the scope gate with the reason.
   transferred to a new owner: stop and report. Both are compromise signals.
 - Opening a PR is expected; merging is not. Never force-push, never commit to
   the default branch. Audit or dry run requested? Report only, skip step 6.
+- **This applies to every commit you make in a target repo, not just dependency
+  bumps.** Closing a Dependabot PR, adding a `dependabot.yml` ignore rule,
+  editing CI config, or any other administrative change still goes on a branch
+  with a PR — never a direct commit to the default branch, even for a one-line
+  config change that "obviously" needs no review. A human approves every
+  change that lands in a repo you don't own the default branch policy for.
 - Efficiency means fewer round trips, never fewer checks. Skipping a manifest,
   sampling a subset, or trusting a lockfile diff without resolving it is a gap
   in exactly the place this agent exists to cover.
