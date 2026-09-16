@@ -63,10 +63,17 @@ Each `batch` row carries a `status`:
 | `current` | Already on target | Nothing. |
 | `resolved` | No pinned version to compare | Decide whether to pin; report. |
 | `held_back` | Newer version inside the window | **Not an error.** Keep current, report hours short. |
+| `peer_held` | The bump violates a peerDependency range another package in the sweep declares | **Not an error.** `npm ci` would fail on it. Keep current, report the requirer and range from `peer_conflicts`. |
+| `above_ceiling` | The pin is newer than a `VERSION_CEILING` allows | **Never downgrade.** Keep the pin, report the ceiling's `reason`. |
+| `ahead` | The pin is newer than anything selectable, with no ceiling in play | Keep the pin. Usually a placeholder release (react-native's `1000.0.0`). |
 | `error` | 404 / bad spec / network | Retry with `pkg` or `action`, then report by hand. |
 
 `batch` exits 3 if any row errored, but every other row still resolved — read
 the output, don't react to the exit code.
+
+A row can also carry `peer_unverified` — a peer range the resolver could not
+parse (`workspace:*`, a git URL). It is not enforced. Check those by hand
+before trusting the bump.
 
 Flags: `--hours N` (window), `--same-major`, `--allow-prerelease` (off by
 default), `-j N` (concurrency, default 8). `$COOLOFF_HOURS` sets the default.

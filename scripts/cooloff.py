@@ -40,17 +40,59 @@ ECOSYSTEMS = ("npm", "pypi", "crates", "rubygems", "go", "maven", "nuget")
 # major version still safe to propose. Remove the entry once the blocking
 # tool ships support for the newer major.
 VERSION_CEILING = {
-    # @angular-devkit/build-angular (through at least 22.1.7) pins a
-    # peerDependency of typescript ">=6.0 <6.1", and vue-tsc 3.3.11 (latest)
-    # throws ERR_PACKAGE_PATH_NOT_EXPORTED against TS7's restructured
-    # ./lib/tsc export -- confirmed breaking angular#55 and vue-demo#74 on
-    # 2026-09-04.
-    "npm:typescript": 6,
-    # zone.js's jasmine-patch breaks under jasmine-core 7 ("Cannot assign to
-    # read only property 'describe'") -- confirmed breaking hrms#73 on
-    # 2026-09-04.
-    "npm:jasmine-core": 6,
+    # A ceiling is a claim about a *toolchain*, not about a package. It only
+    # holds where the thing that breaks is actually installed -- so each entry
+    # names the packages whose presence makes it apply. A repo that uses
+    # TypeScript without the Angular CLI or vue-tsc is not affected by the
+    # Angular CLI's peer pin, and must not be pushed backwards on its account.
+    "npm:typescript": {
+        "max_major": 6,
+        # @angular-devkit/build-angular (through at least 22.1.7) pins a
+        # peerDependency of typescript ">=6.0 <6.1", and vue-tsc 3.3.11
+        # (latest) throws ERR_PACKAGE_PATH_NOT_EXPORTED against TS7's
+        # restructured ./lib/tsc export -- confirmed breaking angular#55 and
+        # vue-demo#74 on 2026-09-04.
+        "when_present": ["@angular-devkit/build-angular", "vue-tsc"],
+        "reason": "@angular-devkit/build-angular pins typescript >=6.0 <6.1; "
+                  "vue-tsc 3.3.11 fails on TS7's restructured ./lib/tsc export",
+    },
+    "npm:jasmine-core": {
+        "max_major": 6,
+        # zone.js's jasmine-patch breaks under jasmine-core 7 ("Cannot assign
+        # to read only property 'describe'") -- confirmed breaking hrms#73 on
+        # 2026-09-04.
+        "when_present": ["zone.js"],
+        "reason": "zone.js jasmine-patch breaks under jasmine-core 7 "
+                  "(\"Cannot assign to read only property 'describe'\")",
+    },
 }
+
+
+def ceiling_for(ecosystem, name, context_names=None):
+    """The ceiling in force for one package, plus why it did or didn't apply.
+
+    `context_names` is every package name resolved alongside this one -- the
+    repo's actual dependency set. With no context (a bare `pkg` call) the
+    ceiling is applied anyway: erring toward the conservative pin is safe,
+    erring the other way reintroduces a known-broken upgrade.
+    """
+    entry = VERSION_CEILING.get(f"{ecosystem}:{name}")
+    if not entry:
+        return None
+    triggers = entry.get("when_present") or []
+    if not triggers:
+        return {"max_major": entry["max_major"], "reason": entry.get("reason"),
+                "applied": True, "context": "unconditional"}
+    if context_names is None:
+        return {"max_major": entry["max_major"], "reason": entry.get("reason"),
+                "applied": True, "context": "assumed", "triggers": triggers}
+    hit = sorted(set(triggers) & set(context_names))
+    if hit:
+        return {"max_major": entry["max_major"], "reason": entry.get("reason"),
+                "applied": True, "context": "matched", "matched": hit,
+                "triggers": triggers}
+    return {"max_major": entry["max_major"], "reason": entry.get("reason"),
+            "applied": False, "context": "not_present", "triggers": triggers}
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +395,122 @@ FETCHERS = {
 }
 
 
+
+# --------------------------------------------------------------------------
+# npm semver ranges (enough of the grammar to police peer constraints)
+# --------------------------------------------------------------------------
+
+# We only need to answer one question: does the version we are about to write
+# satisfy a peer range some *other* package already declares? A wrong "no"
+# would hold back a legitimate upgrade, so every unparseable range is treated
+# as satisfied and reported rather than enforced.
+
+_CMP_RE = re.compile(r"^(>=|<=|>|<|=|\^|~)?\s*v?(.+)$")
+
+
+def _release(raw: str):
+    parsed = parse_version(raw)
+    return parsed[0] if parsed else None
+
+
+def _pad(rel, n=3):
+    return tuple(rel) + (0,) * (n - len(rel)) if len(rel) < n else tuple(rel)
+
+
+def _upper_bound(op: str, rel):
+    """Exclusive upper bound implied by ^ and ~."""
+    rel = _pad(rel)
+    if op == "^":
+        # ^0.2.3 := >=0.2.3 <0.3.0; ^0.0.3 := >=0.0.3 <0.0.4; else next major.
+        if rel[0] != 0:
+            return (rel[0] + 1, 0, 0)
+        if rel[1] != 0:
+            return (0, rel[1] + 1, 0)
+        return (0, 0, rel[2] + 1)
+    # ~1.2.3 := >=1.2.3 <1.3.0; ~1.2 := >=1.2.0 <1.3.0; ~1 := >=1.0.0 <2.0.0
+    return (rel[0], rel[1] + 1, 0)
+
+
+def _satisfies_simple(ver_rel, clause: str):
+    clause = clause.strip()
+    if clause in ("", "*", "x", "X", "latest"):
+        return True
+    m = _CMP_RE.match(clause)
+    if not m:
+        return None
+    op, raw = m.group(1) or "=", m.group(2).strip()
+    if raw in ("*", "x", "X"):
+        return True
+    # A wildcard inside the version (1.2.x) is a range on the fixed prefix.
+    if re.search(r"[xX*]", raw):
+        prefix = [p for p in re.split(r"\.", raw) if not re.match(r"^[xX*]$", p)]
+        try:
+            fixed = tuple(int(p) for p in prefix)
+        except ValueError:
+            return None
+        return _pad(ver_rel)[: len(fixed)] == fixed
+    rel = _release(raw)
+    if rel is None:
+        return None
+    a, b = _pad(ver_rel), _pad(rel)
+    if op in ("^", "~"):
+        return b <= a < _upper_bound(op, rel)
+    if op == "=":
+        return a == b
+    if op == ">=":
+        return a >= b
+    if op == ">":
+        return a > b
+    if op == "<=":
+        return a <= b
+    if op == "<":
+        return a < b
+    return None
+
+
+def npm_range_satisfies(version: str, spec: str):
+    """True / False / None (range not understood -- caller must not enforce)."""
+    ver_rel = _release(version)
+    if ver_rel is None or spec is None:
+        return None
+    spec = spec.strip()
+    if spec.startswith(("workspace:", "npm:", "file:", "link:", "git", "http")):
+        return None
+    unknown = False
+    for alt in spec.split("||"):
+        alt = alt.strip()
+        if " - " in alt:  # hyphen range: 1.2.3 - 2.3.4
+            lo, _, hi = alt.partition(" - ")
+            lo_r, hi_r = _release(lo.strip()), _release(hi.strip())
+            if lo_r is None or hi_r is None:
+                unknown = True
+                continue
+            if _pad(lo_r) <= _pad(ver_rel) <= _pad(hi_r):
+                return True
+            continue
+        results = [_satisfies_simple(ver_rel, c) for c in alt.split() if c.strip()]
+        if not results:
+            return True
+        if None in results:
+            unknown = True
+            continue
+        if all(results):
+            return True
+    return None if unknown else False
+
+
+def npm_peer_deps(name: str, version: str):
+    """peerDependencies declared by one published npm version."""
+    url = f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}"
+    data = fetch_json(url)
+    meta = (data.get("versions") or {}).get(version) or {}
+    peers = meta.get("peerDependencies") or {}
+    optional = ((meta.get("peerDependenciesMeta") or {}))
+    return {
+        k: v for k, v in peers.items()
+        if not (isinstance(optional.get(k), dict) and optional[k].get("optional"))
+    }
+
 # --------------------------------------------------------------------------
 # selection
 # --------------------------------------------------------------------------
@@ -601,7 +759,8 @@ def emit(result, as_json, plain):
 
 
 def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
-                allow_prerelease=False, same_major_only=False):
+                allow_prerelease=False, same_major_only=False,
+                context_names=None):
     fetcher = FETCHERS[ecosystem]
     try:
         candidates = fetcher(name)
@@ -615,7 +774,8 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
         raise ResolveError(f"no published versions found for {ecosystem}:{name}")
 
     same_major = major_of(current) if same_major_only and current else None
-    max_major = VERSION_CEILING.get(f"{ecosystem}:{name}")
+    ceiling = ceiling_for(ecosystem, name, context_names)
+    max_major = ceiling["max_major"] if ceiling and ceiling["applied"] else None
     chosen, skipped, considered = select(candidates, hours, allow_prerelease, same_major, max_major)
     if not chosen:
         head = ", ".join(s["version"] for s in skipped[:5]) or "none"
@@ -637,6 +797,7 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
         "changed": bool(current) and current.lstrip("^~>=<= v") != chosen["version"],
         "skipped_too_new": skipped,
         "versions_considered": len(considered),
+        "ceiling": ceiling,
     }
 
 
@@ -915,7 +1076,18 @@ def parse_spec(spec: str):
     return eco, name, current or None
 
 
-def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe):
+def _is_backwards(current, target):
+    """True when `target` is strictly older than the pinned `current`."""
+    if not current or not target:
+        return False
+    cur = current.lstrip("^~>=<= v")
+    if parse_version(cur) is None or parse_version(target) is None:
+        return False
+    return sort_key(target) < sort_key(cur)
+
+
+def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe,
+                 context_names=None):
     try:
         eco, name, current = parse_spec(spec)
     except ValueError as e:
@@ -924,7 +1096,8 @@ def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe):
         if eco == "action":
             r = resolve_action(name, hours, allow_prerelease, same_major, max_probe)
         else:
-            r = resolve_pkg(eco, name, current, hours, allow_prerelease, same_major)
+            r = resolve_pkg(eco, name, current, hours, allow_prerelease, same_major,
+                            context_names)
     except ResolveError as e:
         return {
             "spec": spec,
@@ -939,9 +1112,74 @@ def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe):
         # Nothing to compare against (a floating `gem "puma"`, an unpinned
         # PackageReference). Report the resolved target, don't claim it matches.
         r["status"] = "resolved"
+    elif r.get("changed") and _is_backwards(r.get("current"), r.get("target")):
+        # The pinned version is newer than anything we are willing to select.
+        # That is never an "update": applying it would be a downgrade. Say so
+        # in the status so a sweep cannot mistake it for an upgrade to apply.
+        ceiling = r.get("ceiling") or {}
+        r["status"] = "above_ceiling" if ceiling.get("applied") else "ahead"
+        r["changed"] = False
+        r["downgrade_declined"] = {"from": r["current"], "to": r["target"]}
+        r["target"] = r["current"]
     else:
         r["status"] = "update" if r.get("changed") else "current"
     return r
+
+
+
+def enforce_peer_coherence(results):
+    """Hold back any npm bump that would violate a peer range in the same set.
+
+    Packages resolve independently, but they do not install independently:
+    npm refuses the whole tree if one package's chosen version falls outside
+    a peerDependency range another package declares. A bump that cannot be
+    installed is not an update -- it is a held-back one, and saying so here
+    is what keeps a sweep from opening a red PR.
+
+    Only ranges we fully understand are enforced; anything else is reported
+    on the row and left alone.
+    """
+    by_name = {}
+    for r in results:
+        if r.get("ecosystem") == "npm" and r.get("name") and r.get("target"):
+            by_name[r["name"]] = r
+    if len(by_name) < 2:
+        return results
+
+    for requirer in list(by_name.values()):
+        try:
+            peers = npm_peer_deps(requirer["name"], requirer["target"])
+        except Exception:
+            continue  # a peer lookup must never sink the sweep
+        for peer_name, rng in peers.items():
+            target_row = by_name.get(peer_name)
+            if target_row is None or not target_row.get("changed"):
+                continue
+            ok = npm_range_satisfies(target_row["target"], rng)
+            conflict = {
+                "required_by": requirer["name"],
+                "required_by_version": requirer["target"],
+                "range": rng,
+                "offending_version": target_row["target"],
+            }
+            if ok is None:
+                target_row.setdefault("peer_unverified", []).append(conflict)
+                continue
+            if ok:
+                continue
+            current = (target_row.get("current") or "").lstrip("^~>=<= v")
+            reverts = bool(current) and npm_range_satisfies(current, rng) is True
+            target_row["status"] = "peer_held"
+            target_row["changed"] = False
+            target_row.setdefault("peer_conflicts", []).append(conflict)
+            target_row["error"] = (
+                f"{peer_name}@{target_row['target']} violates peer "
+                f"{rng!r} from {requirer['name']}@{requirer['target']}"
+                + ("" if reverts else " (current pin does not satisfy it either)")
+            )
+            if reverts:
+                target_row["target"] = current
+    return results
 
 
 def cmd_batch(args):
@@ -954,15 +1192,28 @@ def cmd_batch(args):
 
     # Registry calls are almost entirely network wait, so they overlap well.
     # Keep the pool modest: these are public registries and `gh` subprocesses.
+    # The whole spec list is the repo's dependency set, which is exactly the
+    # context a scoped version ceiling needs to decide whether it applies.
+    context_names = set()
+    for s in specs:
+        try:
+            eco, nm, _ = parse_spec(s)
+        except ValueError:
+            continue
+        if eco != "action":
+            context_names.add(nm)
+
     results = [None] * len(specs)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
             pool.submit(resolve_spec, s, args.hours, args.allow_prerelease,
-                        args.same_major, args.max_probe): i
+                        args.same_major, args.max_probe, context_names): i
             for i, s in enumerate(specs)
         }
         for fut in concurrent.futures.as_completed(futures):
             results[futures[fut]] = fut.result()
+
+    enforce_peer_coherence(results)
 
     if args.json:
         print(json.dumps(results, indent=2))
@@ -976,6 +1227,15 @@ def cmd_batch(args):
                     detail += "  (no version pinned in source)"
             elif r["status"] == "current":
                 detail = "up to date"
+            elif r["status"] in ("above_ceiling", "ahead"):
+                d = r.get("downgrade_declined") or {}
+                why = (r.get("ceiling") or {}).get("reason")
+                detail = (f"pinned at {d.get('from')}, newest selectable is "
+                          f"{d.get('to')} -- keeping the pin, NOT a downgrade")
+                if why:
+                    detail += f"  [ceiling: {why}]"
+            elif r["status"] == "peer_held":
+                detail = r["error"]
             else:
                 detail = r["error"]
             print(f"{r['status'].upper():<10} {r['spec']:<{width}}  {detail}")
