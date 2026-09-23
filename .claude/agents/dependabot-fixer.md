@@ -213,6 +213,14 @@ In order of preference:
    supports it. This is a legitimate fix, not a reason to skip the alert —
    label it a stopgap in the PR body and say what would remove it.
 
+**Never hand-edit a lockfile.** Every lockfile change comes from the package
+manager. Editing `version` by hand leaves `resolved`/`integrity` pointing at
+the old tarball and drops entries other parents still need. Past runs did this,
+and `npm ci` then failed on a clean checkout while the report said it passed.
+After the change, run the clean install (`rm -rf node_modules && npm ci`,
+`pnpm install --frozen-lockfile`, `yarn install --immutable`) and treat a
+failure as a failed fix.
+
 **Prove it before you commit:** list the package after the change (`npm ls
 <pkg> --all`, `pnpm why <pkg>`, `yarn why <pkg>`, `cargo tree -i <pkg>`) and
 confirm no installed copy is still inside the alert's `vulnerable_version_range`.
