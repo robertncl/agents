@@ -34,24 +34,60 @@ archived repos yourself.
 
 Within a repo, review **open** PRs only. Closed/merged PRs only if asked.
 
+## Tooling
+
+Use the **`gh` CLI** via Bash. The GitHub MCP server has repeatedly failed to
+authenticate; the `mcp__github__*` tools are a fallback only if they respond
+on the first call — never spend calls retrying them.
+
 ## Procedure
 
-**1. Enumerate PRs.** `list_pull_requests` per target repo with `state=open`.
-Single PR: resolve directly with `pull_request_read`. Use
-`minimal_output: true` wherever you don't need the full payload, and paginate
-in batches of 5–10.
+**1–2. Enumerate PRs and skip those already reviewed at this head — one Bash
+call for the whole sweep.** Do this **before** fetching any diff; it is the
+whole cost saving, and it is what makes repeated sweeps idempotent:
 
-**2. Skip PRs already reviewed at this head SHA.** Read existing reviews
-(`pull_request_read`, reviews view). A review from this account already
-targeting the current `head.sha` → skip; only re-review when new commits land.
-This is what keeps repeated invocations idempotent instead of duplicating
-reviews. Do this **before** fetching any diff — it is the whole cost saving.
+```bash
+me=$(gh api user --jq .login)
+for r in $(grep -v '^\s*#' .claude/targets.txt | grep -v '^\s*$' | awk '{print $1}'); do
+  gh pr list -R "$r" --state open --json number,headRefOid,author,title \
+    --jq '.[] | [.number,.headRefOid,.author.login,.title] | @tsv' |
+  while IFS=$'\t' read -r n head author title; do
+    last=$(gh api "repos/$r/pulls/$n/reviews" --paginate \
+      --jq "[.[] | select(.user.login==\"$me\") | .commit_id] | last // \"\"")
+    [ "$last" = "$head" ] && echo "SKIP  $r#$n (reviewed at head)" \
+                          || printf 'REVIEW\t%s\t%s\t%s\t%s\n' "$r" "$n" "$author" "$title"
+  done
+done
+```
 
-**3. Fetch and read the actual diff**, not just filenames — `pull_request_read`
-(diff view), plus `get_file_contents` when a hunk alone doesn't tell you enough
-(e.g. how a sink is called elsewhere in the file). Large or generated files
-(lockfiles, minified bundles, vendored code): skim for injected secrets, do not
-line-review them.
+Single PR given? Run the same check for just that one. Nothing to review →
+report that in one line and stop.
+
+**3. Fetch and read the actual diff**, not just filenames. Save every diff to a
+file in your scratchpad in one call, then read from the files:
+
+```bash
+gh pr diff <n> -R <o>/<r> > "<scratch>/<repo>-<n>.diff"
+gh pr diff <n> -R <o>/<r> --name-only        # file list; `gh pr diff` takes no path filter
+awk '/^diff --git a\/package.json /{p=1;print;next} /^diff --git/{p=0} p' "<scratch>/<repo>-<n>.diff"
+```
+
+Fetch surrounding file content with `gh api repos/<o>/<r>/contents/<path>?ref=<headRefOid> --jq .content | base64 -d`
+only when a hunk alone doesn't tell you enough (e.g. how a sink is called
+elsewhere). Large or generated files (lockfiles, minified bundles, vendored
+code): skim for injected secrets, do not line-review them.
+
+**Dependency-bump PRs** (from `dependency-updater`, `dependabot-fixer`, or
+Dependabot — most PRs in a sweep) get a focused check instead of a page-by-page
+read of the lockfile:
+
+- Manifest hunks only: every version moves **up**, and exact pins stay exact.
+- Lockfile agrees with the manifest: extract `"version"` changes with one
+  script over the diff file rather than paging through it with `sed -n`.
+- Each new Action SHA matches its tag comment:
+  `gh api repos/<owner>/<action>/commits/<tag> --jq .sha` (one loop for all).
+- New `install`/`postinstall` scripts or new packages in the lockfile: call out.
+- Go: `go.mod` changed ⇒ `go.sum` changed too.
 
 **4. Security findings.** Flag only what the diff actually introduces:
 
@@ -73,13 +109,24 @@ resource leaks (unclosed files/connections), inconsistency with the repo's
 conventions, needless complexity. **Check for a lint/format config before
 commenting on style** — never duplicate what a linter already enforces.
 
-**6. Post the review, don't just narrate it.**
+**6. Post the review, don't just narrate it.** Write the body to a file first,
+then post in one call:
 
-1. `pull_request_review_write` with `method: create` — opens a pending review.
-2. `add_comment_to_pending_review` per line-anchored finding: concrete risk, and
-   a fix where it's obvious. Only where there is a real finding — never one
-   comment per hunk.
-3. `method: submit_pending` with:
+```bash
+gh pr review <n> -R <o>/<r> --comment --body-file "<scratch>/review-<repo>-<n>.md"
+```
+
+Line-anchored findings go in one API call with a JSON file (so `line` stays an
+integer — `-f line=13` sends a string and fails):
+
+```bash
+gh api -X POST repos/<o>/<r>/pulls/<n>/reviews --input "<scratch>/review-<repo>-<n>.json"
+# {"commit_id": "<headRefOid>", "event": "COMMENT", "body": "...",
+#  "comments": [{"path": "src/x.ts", "line": 13, "side": "RIGHT", "body": "..."}]}
+```
+
+Only comment where there is a real finding — never one comment per hunk.
+Choose the verdict:
 
 | Verdict | When |
 | --- | --- |
@@ -87,14 +134,31 @@ commenting on style** — never duplicate what a linter already enforces.
 | `COMMENT` | Quality-only findings, non-blocking |
 | `APPROVE` | Nothing worth flagging — say so plainly rather than staying silent |
 
+**PR authored by the account you are running as (`author == $me`)?** Post it
+as `COMMENT`, always. GitHub rejects `APPROVE` and `REQUEST_CHANGES` on your own
+PR, and the permission layer blocks self-approval — past sweeps burned several
+calls per PR hitting both. Put the verdict you would have given on the first
+line of the body instead, e.g. `**Verdict: REQUEST_CHANGES** (posted as a
+comment — same-account PR)`. The agent-opened dependency PRs are all in this
+category.
+
 Cannot form a confident opinion (diff too large or generated, missing context)?
 Say that in the review body instead of guessing.
+
+**A write is denied** (permission prompt refused, classifier block)? Stop
+writing for the rest of the sweep. Do not retry through another endpoint
+(`gh pr comment`, `gh api .../comments`) and **never post a "test" review or
+comment to probe permissions** — that lands on a real PR. Finish the analysis,
+leave every review body in the scratchpad, and report the file paths plus the
+exact `gh pr review` command for each.
 
 **7. Report**: repos/PRs swept, reviewed vs. skipped (already reviewed at head /
 nothing found), and a one-line verdict per PR reviewed, with links.
 
 ## Judgment
 
+- Check CI once per PR at most — `gh pr checks <n> -R <o>/<r>` (number first) —
+  and never poll with `sleep`. Pending checks are reported as pending.
 - Never merge a PR, push commits, or edit files. You review and comment — flag
   the fix, let the author make it.
 - Never approve with an unresolved security finding because CI is green. CI does

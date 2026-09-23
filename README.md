@@ -80,7 +80,10 @@ report). Sweeping every repo the account owns is opt-in, by asking for it.
 
 It's invoked on demand, not a persistent webhook listener: each run sweeps
 open PRs, skips ones it already reviewed at the current head commit, and
-posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest.
+posts a fresh review (`REQUEST_CHANGES`/`COMMENT`/`APPROVE`) on the rest. PRs
+opened by the same account — including every PR the other two agents open — are
+posted as `COMMENT` with the verdict in the body, since GitHub rejects approving
+or requesting changes on your own PR. It drives GitHub through the `gh` CLI.
 
 What it checks:
 
@@ -124,8 +127,10 @@ Processes a repository's open Dependabot security alerts and lands **one
 branch, commit, and pull request per vulnerability**, so each fix can be
 reviewed, merged, or reverted on its own.
 
-Alerts come from `gh api /repos/{owner}/{repo}/dependabot/alerts` (they aren't
-exposed via the GitHub MCP tools). Alerts on the same package are grouped into
+Alerts come from `gh api "/repos/{owner}/{repo}/dependabot/alerts?state=open"`
+(they aren't exposed via the GitHub MCP tools). The scope gate and the open-alert
+count for every target repo come back from one call, so repos with nothing open
+cost one line rather than a full pass. Alerts on the same package are grouped into
 a single PR; work is ordered critical → high → medium → low.
 
 The alert list is fed straight into `cooloff.py batch`, so every fix version —
@@ -217,7 +222,17 @@ scripts/cooloff.py action actions/checkout@v4 --json
 
 # audit pin state of every `uses:` in .github/workflows (exit 2 if unpinned)
 scripts/cooloff.py scan-actions --dir .
+
+# apply saved batch results to every workflow `uses:` in one pass
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > batch.json
+scripts/cooloff.py pin-actions batch.json --dir . [--dry-run]
 ```
+
+`pin-actions` never resolves anything itself: it rewrites each external
+`uses:` to `owner/repo[/path]@<sha> # <tag>` from rows `batch` already
+resolved, lists any unpinned ref it had no row for (held back or errored), and
+exits 4 without writing if an existing pin's SHA no longer matches its tag
+comment — a moved tag is a compromise signal, not an update.
 
 `scan-deps` reads `package.json`, `requirements*.txt`, `pyproject.toml`
 (PEP 621 and Poetry), `Cargo.toml`, `go.mod`, `Gemfile`, `*.csproj`/`*.fsproj`,
@@ -229,7 +244,8 @@ version, or a TOML manifest on Python 3.10 without `tomllib` — is reported as 
 `batch` resolves specs concurrently (`-j`, default 8) behind a shared response
 cache, and labels each row `update`, `current`, `resolved` (nothing pinned to
 compare against), `held_back` (newer version still inside the window), or
-`error`. It exits 3 if any row errored — the other rows still resolved.
+`error`. It exits 3 if any row errored — the other rows still resolved. Empty stdin
+(`scan-deps` on a repo with no manifests) prints `[]` and exits 0.
 
 Ecosystems: `npm`, `pypi`, `crates`, `rubygems`, `go`, `maven`, `nuget`, plus
 `action:` specs in batch input.

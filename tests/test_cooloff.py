@@ -169,5 +169,69 @@ class TestBackwardsGuard(unittest.TestCase):
         self.assertFalse(cooloff._is_backwards(None, "1.0.0"))
 
 
+class TestPinActions(unittest.TestCase):
+    """Sweeps spent ~190 Read/Edit calls hand-rewriting `uses:` lines."""
+
+    OLD = "a" * 40
+    NEW = "b" * 40
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        wf = os.path.join(self.root, ".github", "workflows")
+        os.makedirs(wf)
+        self.path = os.path.join(wf, "ci.yml")
+        with open(self.path, "w") as fh:
+            fh.write(
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                f"      - uses: github/codeql-action/init@{self.OLD} # v4.1.0\n"
+                "      - uses: ./local-action\n"
+                "      - name: held\n"
+                "        uses: 'docker/login-action@v3'\n"
+            )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self):
+        return [
+            {"kind": "action", "repo": "actions/checkout", "tag": "v5.0.1",
+             "sha": self.NEW, "status": "update"},
+            {"kind": "action", "repo": "github/codeql-action", "tag": "v4.2.0",
+             "sha": self.NEW, "status": "update"},
+            {"spec": "action:docker/login-action@v3", "status": "held_back"},
+        ]
+
+    def test_rewrites_and_keeps_subpath(self):
+        changes, mismatches, left = cooloff.plan_pins(self.root, self.rows())
+        cooloff.apply_pins(self.root, changes)
+        text = open(self.path).read()
+        self.assertIn(f"      - uses: actions/checkout@{self.NEW} # v5.0.1\n", text)
+        self.assertIn(f"      - uses: github/codeql-action/init@{self.NEW} # v4.2.0\n", text)
+        self.assertIn("./local-action", text)
+        self.assertEqual(mismatches, [])
+        # The held-back action stays on its tag and is surfaced, not dropped.
+        self.assertEqual([f["uses"] for f in left], ["docker/login-action@v3"])
+        self.assertIn("uses: 'docker/login-action@v3'", text)
+
+    def test_already_current_is_noop(self):
+        rows = [{"kind": "action", "repo": "github/codeql-action", "tag": "v4.1.0",
+                 "sha": self.OLD, "status": "current"}]
+        changes, mismatches, _ = cooloff.plan_pins(self.root, rows)
+        self.assertEqual([c for c in changes if "codeql" in c["uses"]], [])
+        self.assertEqual(mismatches, [])
+
+    def test_moved_tag_is_mismatch_not_update(self):
+        rows = [{"kind": "action", "repo": "github/codeql-action", "tag": "v4.1.0",
+                 "sha": self.NEW, "status": "current"}]
+        changes, mismatches, _ = cooloff.plan_pins(self.root, rows)
+        self.assertEqual(changes, [])
+        self.assertEqual(len(mismatches), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
