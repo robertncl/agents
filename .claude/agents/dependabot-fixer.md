@@ -293,6 +293,15 @@ dependency-updater). Then:
   option in lodash < 4.17.21. CVE-2021-23337.
   ```
 
+- **Check the diff before you push.** `git diff "origin/$def" --stat` and
+  `grep` the lockfile diff for every `package@version` the PR title and body
+  name. A diff that only renames the lockfile's `"name"`, bumps
+  `lockfileVersion`, or deletes the vulnerable entry without adding the
+  patched one is **not a fix** — do not open the PR; report the item as
+  `resolve failed` with what the diff actually contained. The title and body
+  state the version the lockfile resolved, not the one you asked for. Past
+  runs opened 13 PRs whose only change was `"name": "JS" → "repo"`, and 5 that
+  named versions that never appeared in their own diffs.
 - `git push -u origin <branch>`, then `gh pr create`. Body carries: alert
   number(s), severity, GHSA/CVE with link, version change, direct or transitive
   (and via what), the step 5 before/after proof for transitive fixes, the
