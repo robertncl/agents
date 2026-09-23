@@ -270,3 +270,26 @@ annotated-tag date, and release date, so a tag pointing at an old commit cannot
 understate its age.
 
 Requires Python 3.10+ and, for the `action` subcommand, an authenticated `gh`.
+
+### scripts/verify_alerts.py
+
+The dependabot-fixer's post-push check. It reads the npm or pnpm lockfile for
+each alert's manifest **from GitHub at a given ref**, not from a local
+checkout, so neither an unpushed working tree nor a sibling agent's clone can
+make a fix look done:
+
+```bash
+# every open alert against a PR branch
+scripts/verify_alerts.py robertncl/JS dependabot-fix/npm-express-and-node-fetch
+
+# only the alerts a PR claims; exit 1 if any is still vulnerable
+scripts/verify_alerts.py robertncl/node1 dependabot-fix/npm-transitive-root --alerts 1,2,5
+```
+
+Each alert is `fixed` (no installed copy, nested ones included, is inside the
+advisory's `vulnerable_version_range`), `vulnerable` (lists the offending
+versions), or `unsupported` (no npm/pnpm lockfile beside the manifest; check by
+hand). It compares against the range rather than `first_patched_version`, so a
+fix backported to an older line (picomatch 2.3.2 against a 4.0.4 floor) counts
+as fixed. Reads npm lockfile v1–v3 and pnpm v5, v6, and v9. Needs an
+authenticated `gh`.

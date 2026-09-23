@@ -122,6 +122,38 @@ checks and anything batch could not resolve.
 Step 4 feeds the floor in as the `@current` of the spec so `--same-major` keeps
 the answer on the floor's major line.
 
+`scripts/verify_alerts.py <owner/repo> <ref> [--alerts N,M]` reads the npm or
+pnpm lockfile **from GitHub at that ref** and reports each open alert as
+`fixed`, `vulnerable` (with the installed versions still inside the range), or
+`unsupported` (other ecosystems — check by hand). Exit 0 only when every
+checked alert is fixed. Step 7 requires it after every push.
+
+## Working directory — one per repo, never shared
+
+Several instances of you often run in parallel, and they share one scratchpad.
+Past runs cloned into generic paths (`$SCRATCH/repo`, `all_alerts.jsonl`,
+`final_report.txt`) and read each other's checkouts: one reported a Vite app's
+alerts against an Express repo, another analysed a sibling's package.json and
+concluded astro "is not a dependency". Every file you write goes under a
+directory unique to this repo *and* this run:
+
+```bash
+work=$(mktemp -d "${SCRATCH:-${TMPDIR:-/tmp}}/dependabot-<repo>-XXXXXX")
+git clone "https://github.com/<owner>/<repo>.git" "$work/src"
+```
+
+Keep alert dumps, cooloff output, PR bodies, and reports inside `$work` too.
+Never reuse a directory you did not create in this run, and never `cd` into a
+bare relative path like `repo/`.
+
+**Before every commit and every push**, confirm you are where you think:
+
+```bash
+git -C "$work/src" remote get-url origin   # must name <owner>/<repo>
+```
+
+Mismatch → stop, discard that analysis, re-clone. Do not "fix" the remote.
+
 ## Procedure
 
 **1. Gate.** Run the scope gate above for each target repo.
@@ -217,9 +249,25 @@ In order of preference:
 manager. Editing `version` by hand leaves `resolved`/`integrity` pointing at
 the old tarball and drops entries other parents still need. Past runs did this,
 and `npm ci` then failed on a clean checkout while the report said it passed.
-After the change, run the clean install (`rm -rf node_modules && npm ci`,
-`pnpm install --frozen-lockfile`, `yarn install --immutable`) and treat a
-failure as a failed fix.
+
+**Never delete or regenerate the lockfile either.** Change it only with a
+targeted command against the existing file (`npm install <pkg>@<ver>` for a
+direct dep, `npm update <pkg>`, `pnpm update <pkg>`, `pnpm add <pkg>@<ver>`,
+the step 5 list above). Deleting it and running a plain install re-resolves
+*every* package: specs like `"latest"` or `"*"` jump to whatever is newest
+(a `next` bump in v0-vercel-test dragged `"ai": "latest"` to 7.x and broke the
+build on zod), and unrelated drift lands in a security PR. Use the package
+manager version that matches the lockfile — `lockfileVersion: 1` means npm 6
+(`npx -y npm@6 ...`); letting npm 8+ rewrite it to v3 is a format migration,
+not a security fix.
+
+"Clean install" means installing **from** the committed lockfile into an empty
+`node_modules` — `rm -rf node_modules && npm ci`, `pnpm install
+--frozen-lockfile`, `yarn install --immutable`. It proves the lockfile is
+complete; it never writes to it. A failure there is a failed fix. After it,
+`git diff "origin/$def" -- <lockfile>` must name only packages this fix is
+meant to move (plus their own new sub-dependencies); anything else means the
+file was re-resolved — start the branch over.
 
 **Prove it before you commit:** list the package after the change (`npm ls
 <pkg> --all`, `pnpm why <pkg>`, `yarn why <pkg>`, `cargo tree -i <pkg>`) and
@@ -310,7 +358,22 @@ dependency-updater). Then:
   state the version the lockfile resolved, not the one you asked for. Past
   runs opened 13 PRs whose only change was `"name": "JS" → "repo"`, and 5 that
   named versions that never appeared in their own diffs.
-- `git push -u origin <branch>`, then `gh pr create`. Body carries: alert
+- `git push -u origin <branch>`, then **verify what you pushed**, before
+  opening the PR:
+
+  ```bash
+  scripts/verify_alerts.py <owner>/<repo> <branch> --alerts <this PR's alert numbers>
+  ```
+
+  It reads the lockfile from GitHub, not your working tree. Every alert the PR
+  claims must come back `fixed`. Any `vulnerable` row means the pushed commit
+  does not contain the fix, whatever your local `npm ls` said — fix the branch
+  and re-run, or drop that alert from the PR's claims and report it unfixed.
+  Past runs reported "30/30 fixed" for a PR that fixed 11, and "25 fixed" for
+  one whose nested copies under other parents were still vulnerable. For an
+  `unsupported` row (non-npm/pnpm), fetch the pushed lockfile with `gh api
+  repos/<o>/<r>/contents/<path>?ref=<branch>` and check it by hand.
+- Then `gh pr create`. Body carries: alert
   number(s), severity, GHSA/CVE with link, version change, direct or transitive
   (and via what), the step 5 before/after proof for transitive fixes, the
   commands run and their results, and anything a reviewer must check by hand.
@@ -327,6 +390,11 @@ has to decide about. Finish with the count of alerts still open and
 unaddressed, plus every repo skipped at the scope gate and why.
 
 Report exactly, not optimistically:
+
+- Every `addressed by PR #N` row is backed by a `fixed` line from
+  `verify_alerts.py` on that PR's branch. Run it once more per PR at the end
+  (later pushes to sibling branches cannot change it, but a force-reset can)
+  and take the counts from its output, not from memory.
 
 - An alert with a PR is **addressed by PR #N**. It is not "fixed" or "closed" —
   that happens on merge. Never write "23 → 0 open alerts".
