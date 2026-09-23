@@ -96,6 +96,27 @@ coverage is worse than a slow sweep.
 **1. Gate and branch.** Run the scope gate above. Clone if given a URL. Create
 a branch — never work on the default branch.
 
+Cut the branch from the **remote** default branch, never from whatever the
+checkout happens to be sitting on. A local checkout is routinely parked on a
+leftover branch from an earlier sweep:
+
+```bash
+git fetch origin
+def=$(git symbolic-ref --short refs/remotes/origin/HEAD | cut -d/ -f2-)
+git checkout -B "chore/deps-$(date +%Y%m%d-%H%M)" "origin/$def"
+```
+
+- **Give the branch a unique, timestamped name.** A fixed per-repo name like
+  `chore/deps-update-npm` gets reused by the next sweep and silently stacks this
+  run's commit on top of the last run's unmerged one, so the PR carries changes
+  its title never mentions.
+- **Verify you are not behind.** `git rev-list --left-right --count
+  "origin/$def...HEAD"` must report `0` on the left. A branch cut from a stale
+  base produces a diff that *reverts* whatever the default branch gained in the
+  meantime — deleted config files, downgraded pins — none of which you intended.
+- Re-derive every target version against the base you just cut from. Cached
+  resolution output from an earlier run describes a tree that no longer exists.
+
 **2. Resolve everything, once.** Run the `scan-deps | batch` command. Keep the
 JSON. Everything below edits files to match decisions this step already made —
 do not re-query per package as you edit, and do not re-run the sweep after each
@@ -122,6 +143,23 @@ integrity hashes.
 
 - Write exact versions (`"react": "19.2.0"`, not `^19.2.0`) unless the repo has
   clearly chosen ranges — match the existing convention and say what you did.
+- **Edit the version in place, inside the block the dependency already lives
+  in.** Find the existing key in `dependencies`, `devDependencies`,
+  `optionalDependencies` (or `[project]`/`[project.optional-dependencies]`, or
+  the `.in` file feeding a compiled lock) and change its value. Never append a
+  dependency entry at the **top level** of the manifest. `{"react": "19.2.0"}`
+  sitting next to `"name"` and `"private"` is not a dependency declaration —
+  every installer ignores it, so the PR merges green and upgrades nothing.
+- **Never overwrite a non-dependency key.** A manifest's top level also holds
+  configuration — `jest`, `overrides`, `resolutions`, `scripts`, `workspaces`.
+  If a config key shares a name with a package (`"jest": { "preset": ... }`),
+  leave it completely alone; the version belongs in `devDependencies`.
+- **Never write a version lower than the one already there.** Compare against
+  the base you cut from and drop the entry if it is not a genuine upgrade. Say
+  in the PR which targets you dropped as already-satisfied.
+- After editing, re-read the manifest and confirm it still parses and that each
+  intended key changed in the block you meant. A manifest edit that lands in the
+  wrong place is indistinguishable from success until someone installs.
 - Always regenerate and commit the lockfile (`package-lock.json`,
   `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `Cargo.lock`, `Gemfile.lock`,
   `go.sum`). The lockfile is what pins the transitive tree.
