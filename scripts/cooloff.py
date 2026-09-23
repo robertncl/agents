@@ -779,6 +779,92 @@ def cmd_scan_actions(args):
         sys.exit(2)
 
 
+_USES_PREFIX_RE = re.compile(r"^(\s*(?:-\s*)?uses:\s*)")
+_PINNABLE = ("update", "current", "resolved")
+
+
+def _action_repo(uses: str) -> str:
+    return "/".join(uses.split("@")[0].strip("/").split("/")[:2]).lower()
+
+
+def plan_pins(root: str, rows):
+    """Decide the rewrite for every `uses:` line from already-resolved batch rows.
+
+    Sweeps used to spend a Read plus one Edit per `uses:` line, across every
+    workflow, to apply decisions `batch` had already made. This applies them
+    in one pass. It never resolves anything itself.
+
+    Returns (changes, mismatches, left_alone). A line already pinned with the
+    resolved tag in its comment but a *different* SHA is a mismatch: the tag
+    moved, which is a compromise signal, not an update.
+    """
+    by_repo = {}
+    for r in rows:
+        if (r.get("kind") == "action" and r.get("sha") and r.get("tag")
+                and r.get("status") in _PINNABLE):
+            by_repo[r["repo"].lower()] = r
+
+    changes, mismatches, left_alone = [], [], []
+    for f in collect_uses(root):
+        row = by_repo.get(_action_repo(f["uses"]))
+        if not row:
+            if not f["pinned"]:
+                left_alone.append(f)
+            continue
+        path_part, _, ref = f["uses"].partition("@")
+        if f["pinned"] and f["comment"] == row["tag"]:
+            if ref != row["sha"]:
+                mismatches.append({**f, "expected_sha": row["sha"], "tag": row["tag"]})
+            continue
+        changes.append({**f, "new": f"{path_part}@{row['sha']} # {row['tag']}"})
+    return changes, mismatches, left_alone
+
+
+def apply_pins(root: str, changes):
+    by_file = {}
+    for c in changes:
+        by_file.setdefault(c["file"], {})[c["line"]] = c["new"]
+    for rel, lines in by_file.items():
+        path = os.path.join(root, rel)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.readlines()
+        for lineno, new in lines.items():
+            old = text[lineno - 1]
+            m = _USES_PREFIX_RE.match(old)
+            if not m:  # file changed between scan and write
+                raise RuntimeError(f"{rel}:{lineno} no longer a `uses:` line")
+            eol = "\r\n" if old.endswith("\r\n") else "\n"
+            text[lineno - 1] = f"{m.group(1)}{new}{eol}"
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.writelines(text)
+
+
+def cmd_pin_actions(args):
+    root = os.path.abspath(args.dir)
+    src = sys.stdin if args.results == "-" else open(args.results, encoding="utf-8")
+    with src:
+        rows = json.load(src)
+    changes, mismatches, left_alone = plan_pins(root, rows)
+
+    for c in changes:
+        old = c["uses"] + (f" # {c['comment']}" if c["comment"] else "")
+        print(f"{c['file']}:{c['line']}  {old}  ->  {c['new']}")
+    for f in left_alone:
+        print(f"note: left unpinned (no pinnable batch row -- held back or errored?): "
+              f"{f['file']}:{f['line']}  {f['uses']}", file=sys.stderr)
+    if mismatches:
+        for mm in mismatches:
+            print(f"MISMATCH {mm['file']}:{mm['line']}  {mm['uses']} # {mm['tag']}  "
+                  f"but {mm['tag']} resolves to {mm['expected_sha']}", file=sys.stderr)
+        # Fail closed: a moved tag means stop and report, not a partial rewrite.
+        die("tag/SHA mismatch -- nothing written; report it, do not re-pin", code=4)
+    if not args.dry_run:
+        apply_pins(root, changes)
+    verb = "would rewrite" if args.dry_run else "rewrote"
+    print(f"\n{verb} {len(changes)} `uses:` lines in "
+          f"{len({c['file'] for c in changes})} files", file=sys.stderr)
+
+
 # --------------------------------------------------------------------------
 # package command
 # --------------------------------------------------------------------------
@@ -1217,10 +1303,16 @@ def enforce_peer_coherence(results):
 
 def cmd_batch(args):
     specs = list(args.specs)
-    if not specs or specs == ["-"]:
+    from_stdin = not specs or specs == ["-"]
+    if from_stdin:
         specs = [l.strip() for l in sys.stdin.read().splitlines()]
     specs = [s for s in specs if s and not s.startswith("#")]
     if not specs:
+        if from_stdin and args.specs == ["-"]:
+            # `scan-deps | batch -` on a repo with no manifests: nothing to
+            # resolve is a result ("current"), not a failure to go debug.
+            print("[]" if args.json else "nothing to resolve")
+            return
         die("no specs given (pass them as arguments or on stdin)")
 
     # Registry calls are almost entirely network wait, so they overlap well.
@@ -1307,6 +1399,13 @@ def main():
     ss.add_argument("--dir", default=".")
     ss.add_argument("--json", action="store_true")
     ss.set_defaults(func=cmd_scan_actions)
+
+    spn = sub.add_parser("pin-actions",
+                         help="rewrite every workflow `uses:` from saved `batch --json` output")
+    spn.add_argument("results", help="batch --json output file, or `-` for stdin")
+    spn.add_argument("--dir", default=".")
+    spn.add_argument("--dry-run", action="store_true", help="print the rewrites, write nothing")
+    spn.set_defaults(func=cmd_pin_actions)
 
     sd = sub.add_parser("scan-deps", help="list every dependency in the tree as a batch spec")
     sd.add_argument("--dir", default=".")

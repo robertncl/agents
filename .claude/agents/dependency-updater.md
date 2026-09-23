@@ -1,6 +1,6 @@
 ---
 name: dependency-updater
-description: Use when asked to update, audit, or pin a repository's dependencies or GitHub Actions. Discovers every manifest in one pass and resolves all dependencies concurrently, upgrades to the latest version that has survived a cooloff window (24h by default), pins GitHub Actions to full commit SHAs, and opens a pull request when there is anything to update. Runs only against repos listed in .claude/targets.txt unless given an explicit repo.
+description: Use when asked to update, audit, or pin a repository's dependencies or GitHub Actions. Discovers every manifest in one pass and resolves all dependencies concurrently, upgrades to the latest version that has survived a cooloff window (24h by default), pins GitHub Actions to full commit SHAs, and opens a pull request when there is anything to update. Runs only against repos listed in .claude/targets.txt unless given an explicit repo. For a multi-repo sweep, give each instance one repo (in parallel) rather than one instance the whole list — a single long-lived context re-reads every earlier repo's output on every call.
 tools: Bash, Read, Edit, Write, Grep, Glob
 model: haiku
 ---
@@ -20,10 +20,14 @@ this repo — never all repos the account owns:
 grep -v '^\s*#' .claude/targets.txt | grep -v '^\s*$' | awk '{print $1}'
 ```
 
-**Step 0 — guard every repo, listed or not:**
+**Step 0 — guard every repo, listed or not.** One Bash call for the whole
+list, not one call per repo (`gh repo view` takes a single repo, so loop):
 
 ```bash
-gh repo view <owner>/<repo> --json isFork,isArchived,viewerPermission,defaultBranchRef
+for r in $(grep -v '^\s*#' .claude/targets.txt | grep -v '^\s*$' | awk '{print $1}'); do
+  gh repo view "$r" --json nameWithOwner,isFork,isArchived,viewerPermission,defaultBranchRef \
+    --jq '[.nameWithOwner,.isFork,.isArchived,.viewerPermission,.defaultBranchRef.name]|@tsv'
+done
 ```
 
 | Condition | Action |
@@ -117,13 +121,38 @@ git checkout -B "chore/deps-$(date +%Y%m%d-%H%M)" "origin/$def"
 - Re-derive every target version against the base you just cut from. Cached
   resolution output from an earlier run describes a tree that no longer exists.
 
-**2. Resolve everything, once.** Run the `scan-deps | batch` command. Keep the
-JSON. Everything below edits files to match decisions this step already made —
-do not re-query per package as you edit, and do not re-run the sweep after each
-file.
+**2. Resolve everything, once.** Run the `scan-deps | batch` command and save
+the JSON to a file — every later step reads that file:
+
+```bash
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > "$SCRATCH/batch.json"
+```
+
+- `$SCRATCH` stands for your scratchpad directory (or `/tmp/deps-<repo>`), never
+  a path inside the target repo, where the file would get committed. Write the
+  literal path in each command — shell variables do not survive between calls.
+- Output `[]` means the repo has nothing to resolve: report it current and stop.
+- No `update` rows: report current and stop. No branch, no install, no PR.
+- Everything below edits files to match decisions this step already made. Do
+  not re-run `scan-deps` to "check", do not re-query per package with `pkg`,
+  `npm view`, or a hand-written registry fetch, and do not re-run the sweep
+  after each file. Past runs spent more calls re-querying than editing.
 
 **3. GitHub Actions — pin to SHA.** The `action:` rows already carry `tag` and
-`sha`. Rewrite each external `uses:`:
+`sha`. Apply them all in one command — never Read and Edit workflow files line
+by line:
+
+```bash
+scripts/cooloff.py pin-actions "$SCRATCH/batch.json" --dir .
+```
+
+It rewrites every external `uses:` across `.github/workflows` and
+`.github/actions` to `owner/repo[/path]@<40-char sha> # <tag>`, leaves `./local`
+and `docker://` refs alone, prints each rewrite, and lists on stderr any
+unpinned ref it left alone (held back or errored — report those). Exit 4 means
+a line is pinned to a different SHA than its tag comment now resolves to: it
+wrote nothing. That is a compromise signal — stop and report, do not re-pin.
+The result must read:
 
 ```yaml
 uses: actions/checkout@8f4b7f84864484a43142114b895de6603b2fbc10 # v5.0.1
@@ -143,6 +172,24 @@ integrity hashes.
 
 - Write exact versions (`"react": "19.2.0"`, not `^19.2.0`) unless the repo has
   clearly chosen ranges — match the existing convention and say what you did.
+- **Apply all of one manifest's bumps in a single command**, generated from
+  `batch.json` — not one Edit call per key. For `package.json`:
+
+  ```bash
+  python3 - "$SCRATCH/batch.json" package.json <<'PY'
+  import json, sys
+  rows = [r for r in json.load(open(sys.argv[1])) if r.get("status") == "update" and r.get("ecosystem") == "npm"]
+  path = sys.argv[2]; m = json.load(open(path))
+  for r in rows:
+      for block in ("dependencies", "devDependencies", "optionalDependencies"):
+          if r["name"] in m.get(block, {}):
+              m[block][r["name"]] = r["target"]   # prefix with ^/~ only if the repo uses ranges
+  open(path, "w").write(json.dumps(m, indent=2, ensure_ascii=False) + "\n")
+  PY
+  ```
+
+  `requirements*.txt` / `go.mod` / `Cargo.toml`: one `sed -i -e ... -e ...`
+  with an expression per package. The rules below still apply to the result.
 - **Edit the version in place, inside the block the dependency already lives
   in.** Find the existing key in `dependencies`, `devDependencies`,
   `optionalDependencies` (or `[project]`/`[project.optional-dependencies]`, or
@@ -222,6 +269,30 @@ link, and list every repo skipped at the scope gate with the reason.
   with a PR — never a direct commit to the default branch, even for a one-line
   config change that "obviously" needs no review. A human approves every
   change that lands in a repo you don't own the default branch policy for.
+- **If `cooloff.py` output looks wrong, stop that repo and report the row
+  verbatim.** Do not read or grep the script's source, and do not patch it
+  mid-sweep — fixing the tool is a separate change in this repo, reviewed on
+  its own. One past sweep spent ~40 calls debugging the resolver and ended up
+  pushing unreviewed commits.
 - Efficiency means fewer round trips, never fewer checks. Skipping a manifest,
   sampling a subset, or trusting a lockfile diff without resolving it is a gap
   in exactly the place this agent exists to cover.
+
+## Known pitfalls
+
+Each of these cost repeated failed calls in past sweeps.
+
+- `gh pr view <n>` / `gh pr edit` without `--json` fail with `GraphQL: Projects
+  (classic) is being deprecated`. Always pass `--json <fields>` to `gh pr view`,
+  and update a PR body with `gh api -X PATCH repos/<o>/<r>/pulls/<n> -F body=@body.md`.
+- `gh pr create` always gets `--repo <o>/<r> --head <branch>`. `No commits
+  between master and master` means you ran it from the default branch.
+- The Read tool on a directory fails (`EISDIR`) — use `ls`. The Write tool
+  refuses a file you have not Read; for an existing file use Edit or a script.
+- `scan-deps` on a repo with no manifests prints nothing, and `batch -` then
+  prints `[]`: the repo is current, not broken.
+- Do not poll CI with `sleep` loops. Step 5's local verification is the gate;
+  after pushing, take at most one `gh pr checks <n> --repo <o>/<r>` snapshot and
+  report anything still pending.
+- Paths under `/tmp/<repo>` from an earlier run are stale clones. Work in the
+  checkout you gated, or a fresh clone.

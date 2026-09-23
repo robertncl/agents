@@ -27,11 +27,22 @@ this repo — never all repos the account owns:
 grep -v '^\s*#' .claude/targets.txt | grep -v '^\s*$' | awk '{print $1}'
 ```
 
-**Step 0 — guard every repo, listed or not:**
+**Step 0 — guard every repo and count its alerts, in one Bash call.** Most
+repos have zero open alerts on any given run; finding that out should cost one
+line of output, not a separate agent turn per repo:
 
 ```bash
-gh repo view <owner>/<repo> --json isFork,isArchived,viewerPermission,defaultBranchRef
+for r in $(grep -v '^\s*#' .claude/targets.txt | grep -v '^\s*$' | awk '{print $1}'); do
+  g=$(gh repo view "$r" --json isFork,isArchived,viewerPermission,defaultBranchRef \
+        --jq '[.isFork,.isArchived,.viewerPermission,.defaultBranchRef.name]|@tsv')
+  if out=$(gh api "/repos/$r/dependabot/alerts?state=open&per_page=100" --paginate --jq 'length' 2>/dev/null)
+  then n=$(echo "$out" | awk '{s+=$1} END{print s+0}'); else n=ERR; fi
+  printf '%s\t%s\t%s\n' "$r" "$g" "$n"
+done
 ```
+
+Only repos that pass the gate **and** show a non-zero count go further. `ERR`
+means the alerts call failed — handle per the last row below.
 
 | Condition | Action |
 | --- | --- |
@@ -39,7 +50,7 @@ gh repo view <owner>/<repo> --json isFork,isArchived,viewerPermission,defaultBra
 | `isArchived: true` | Stop. Skip. |
 | `viewerPermission` not WRITE/MAINTAIN/ADMIN | Stop. Skip — you cannot push a branch, and finding out after ten fixes wastes the run. |
 | Working tree dirty | Stop. Report. Never stash someone else's work. |
-| `dependabot/alerts` returns 403/404 | First re-check with a **plain GET** (see Tools — a `-f` flag makes `gh api` POST, which always 404s). Only if it still fails: confirm via `/vulnerability-alerts` whether alerts are disabled or the token lacks `security_events`, say which, skip. **Never** substitute `npm audit` and call it "the Dependabot alerts." |
+| `dependabot/alerts` returns 403/404 | Check you used the query-string form from Tools (no `-f`). Then confirm via `gh api -i /repos/<o>/<r>/vulnerability-alerts` (204 = enabled) whether alerts are disabled or the token lacks `security_events`, say which, skip. **Never** substitute `npm audit` and call it "the Dependabot alerts." |
 
 Report every skip and why.
 
@@ -48,7 +59,7 @@ Report every skip and why.
 Dependabot alerts are not exposed through the GitHub MCP tools — use `gh api`.
 
 ```bash
-gh api --paginate --method GET /repos/{owner}/{repo}/dependabot/alerts -f state=open \
+gh api --paginate "/repos/{owner}/{repo}/dependabot/alerts?state=open&per_page=100" \
   --jq '.[] | {n:.number, sev:.security_advisory.severity, ghsa:.security_advisory.ghsa_id,
                cve:.security_advisory.cve_id, pkg:.security_vulnerability.package.name,
                eco:.security_vulnerability.package.ecosystem,
@@ -57,16 +68,10 @@ gh api --paginate --method GET /repos/{owner}/{repo}/dependabot/alerts -f state=
                manifest:.dependency.manifest_path, scope:.dependency.scope}'
 ```
 
-`--method GET` is **not optional**. `gh api` switches to POST as soon as any
-`-f` field is present, and `POST /dependabot/alerts` returns a bare `404 Not
-Found`. That 404 is indistinguishable by eye from "alerts are disabled" or
-"token lacks `security_events`" — do not report either of those conclusions off
-a 404 alone. Confirm first:
-
-```bash
-gh api -i /repos/{owner}/{repo}/vulnerability-alerts   # 204 = alerts enabled
-gh api /repos/{owner}/{repo}/dependabot/alerts --jq 'length'   # no -f, plain GET
-```
+Put the filter **in the URL**, exactly as above. Past runs lost many calls to
+the other forms: `-f state=open` silently turns the request into a POST, which
+returns a bare `404 Not Found` that looks exactly like "alerts disabled"; and a
+separate `'?state=open'` argument fails with `accepts 1 arg(s), received 2`.
 
 A repo with a long history of `fixed` alerts and zero `open` ones is the normal
 healthy outcome, and the correct report is "0 open alerts", not a blocker.
@@ -162,7 +167,7 @@ specs, and check them in one `batch` call — a security bump dragging in a
 brand-new sub-dependency has reopened the door you just closed:
 
 ```bash
-git diff <default-branch> -- package-lock.json \
+git diff "origin/$def" -- package-lock.json \
   | <extract added/bumped name@version> \
   | scripts/cooloff.py batch - --json
 ```
@@ -172,19 +177,26 @@ PR body.
 
 **6. Vulnerable GitHub Actions** (`ecosystem: "actions"`): resolve in the same
 batch as `action:owner/repo@current` specs; the row carries `tag` and `sha`.
-Rewrite as a full 40-char SHA with the tag in a trailing comment —
-`uses: actions/checkout@8f4b7f84... # v5.0.1`. Never leave a floating tag behind
+Save that action's row to a file and apply it with
+`scripts/cooloff.py pin-actions <rows.json> --dir .` — it rewrites every use of
+that action to a full 40-char SHA with the tag in a trailing comment
+(`uses: actions/checkout@8f4b7f84... # v5.0.1`) and touches nothing else.
+Exit 4 (tag now resolves to a different SHA than the pin) is a compromise
+signal: stop and report. Never leave a floating tag behind
 as the "fix"; a mutable tag *is* the vulnerability.
 
 **7. One fix, one branch, one PR.** For each work item, in order:
 
 ```bash
-git checkout <default-branch> && git pull --ff-only     # every branch starts here
-git checkout -b dependabot-fix/<eco>-<package>-<new-version>
+git fetch origin
+def=$(git symbolic-ref --short refs/remotes/origin/HEAD | cut -d/ -f2-)
+git checkout -B dependabot-fix/<eco>-<package>-<new-version> "origin/$def"
 ```
 
-Branching each fix off the **freshly updated default branch**, never off the
-previous fix branch, is what keeps the PRs independently mergeable. Then:
+Branching each fix off the **remote** default branch, never off the previous fix
+branch or whatever the checkout was parked on, is what keeps the PRs
+independently mergeable (the same stale-base bug #16 fixed in
+dependency-updater). Then:
 
 - Edit only the manifest entries this fix requires. No opportunistic upgrades,
   no formatting churn, no unrelated lockfile drift.
@@ -229,3 +241,18 @@ scope gate and why.
   compromise signal.
 - Cannot tell whether the alert reaches exploitable code here? Say so plainly
   rather than asserting impact either way. Ship the bump; let the reviewer judge.
+
+## Known pitfalls
+
+Each of these cost repeated failed calls in past runs.
+
+- `gh repo view` takes one repo; loop. It has no `securityAndAnalysis` field.
+- `gh pr view <n>` / `gh pr edit` without `--json` fail with `GraphQL: Projects
+  (classic) is being deprecated`. Always pass `--json <fields>` to `gh pr view`,
+  and update a PR body with `gh api -X PATCH repos/<o>/<r>/pulls/<n> -F body=@body.md`.
+- `gh pr create` always gets `--repo <o>/<r> --head <branch>`.
+- The Read tool on a directory fails (`EISDIR`) — use `ls`. An alerts or
+  lockfile dump too large to Read goes to a file and gets `jq`/`grep`, not Read.
+- Never `git stash` in a target checkout — a dirty tree is a gate failure.
+- Do not read or patch `scripts/cooloff.py` mid-run. Output that looks wrong is
+  reported with the row verbatim; fixing the tool is a separate change.
