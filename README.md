@@ -288,7 +288,9 @@ scripts/verify_alerts.py robertncl/node1 dependabot-fix/npm-transitive-root --al
 
 Each alert is `fixed` (no installed copy, nested ones included, is inside the
 advisory's `vulnerable_version_range`), `vulnerable` (lists the offending
-versions), or `unsupported` (no npm/pnpm lockfile beside the manifest; check by
+versions), `inconsistent` (an npm entry's `version` disagrees with the tarball
+its `resolved` URL points at -- a hand-edited lockfile that still installs the
+old code), or `unsupported` (no npm/pnpm lockfile beside the manifest; check by
 hand). It compares against the range rather than `first_patched_version`, so a
 fix backported to an older line (picomatch 2.3.2 against a 4.0.4 floor) counts
 as fixed. Reads npm lockfile v1–v3 and pnpm v5, v6, and v9. Needs an

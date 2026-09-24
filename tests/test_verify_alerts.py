@@ -81,5 +81,23 @@ class TestPnpmLock(unittest.TestCase):
         self.assertEqual(got["@scope/pkg"], {"1.2.3"})
 
 
+class TestTarballMismatch(unittest.TestCase):
+    def test_hand_edited_version(self):
+        # node1 #3: version bumped, resolved/integrity left on the old tarball.
+        lock = {"lockfileVersion": 3, "packages": {"node_modules/path-to-regexp": {
+            "version": "0.1.13",
+            "resolved": "https://registry.npmjs.org/path-to-regexp/-/path-to-regexp-0.1.12.tgz"}}}
+        got = va.npm_mismatches(__import__("json").dumps(lock))
+        self.assertEqual(got, {"path-to-regexp": ["0.1.13 (tarball 0.1.12)"]})
+
+    def test_consistent_and_scoped(self):
+        lock = {"lockfileVersion": 3, "packages": {
+            "node_modules/@babel/core": {"version": "7.29.7",
+                "resolved": "https://registry.npmjs.org/@babel/core/-/core-7.29.7.tgz"},
+            "node_modules/x": {"version": "1.0.0-beta.2",
+                "resolved": "https://registry.npmjs.org/x/-/x-1.0.0-beta.2.tgz"}}}
+        self.assertEqual(va.npm_mismatches(__import__("json").dumps(lock)), {})
+
+
 if __name__ == "__main__":
     unittest.main()

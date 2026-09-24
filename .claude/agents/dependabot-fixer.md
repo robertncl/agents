@@ -124,8 +124,10 @@ the answer on the floor's major line.
 
 `scripts/verify_alerts.py <owner/repo> <ref> [--alerts N,M]` reads the npm or
 pnpm lockfile **from GitHub at that ref** and reports each open alert as
-`fixed`, `vulnerable` (with the installed versions still inside the range), or
-`unsupported` (other ecosystems — check by hand). Exit 0 only when every
+`fixed`, `vulnerable` (with the installed versions still inside the range),
+`inconsistent` (npm `version` bumped but `resolved` still on the old tarball —
+a hand-edited lockfile; redo it with the package manager), or `unsupported`
+(other ecosystems — check by hand). Exit 0 only when every
 checked alert is fixed. Step 7 requires it after every push.
 
 ## Working directory — one per repo, never shared
