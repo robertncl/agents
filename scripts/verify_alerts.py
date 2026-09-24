@@ -13,9 +13,11 @@ For every open alert (or only those listed in --alerts) it reports:
   fixed        no installed copy of the package is inside the vulnerable range
   vulnerable   at least one installed copy still is (versions listed)
   unsupported  no npm/pnpm lockfile beside the manifest; verify by hand
+  inconsistent a lockfile entry's `version` disagrees with its `resolved`
+               tarball -- hand-edited; npm still installs the old code
 
-Exit 0 when every checked alert is fixed, 1 when any is vulnerable or
-unsupported, 2 on usage or API errors.
+Exit 0 when every checked alert is fixed, 1 when any is vulnerable,
+inconsistent, or unsupported, 2 on usage or API errors.
 """
 
 from __future__ import annotations
@@ -100,6 +102,37 @@ def npm_versions(text: str) -> dict[str, set[str]]:
     return found
 
 
+TARBALL = re.compile(r"/-/[^/]+?-(\d+\.\d+\.\d+[^/]*?)\.tgz$")
+
+
+def npm_mismatches(text: str) -> dict[str, list[str]]:
+    """Entries whose `resolved` tarball is a different version than `version`.
+
+    A hand-edited lockfile bumps `version` and leaves `resolved`/`integrity`
+    on the old tarball, so npm keeps installing the vulnerable code. Reading
+    `version` alone calls that fixed (node1 #3-#6 did exactly this).
+    """
+    lock = json.loads(text)
+    bad: dict[str, list[str]] = {}
+
+    def check(name, meta):
+        m = TARBALL.search(str(meta.get("resolved") or ""))
+        if name and m and meta.get("version") and m.group(1) != meta["version"]:
+            bad.setdefault(name, []).append(f"{meta['version']} (tarball {m.group(1)})")
+
+    for key, meta in (lock.get("packages") or {}).items():
+        if "node_modules/" in key:
+            check(meta.get("name") or key.rsplit("node_modules/", 1)[1], meta)
+
+    def walk(deps):
+        for name, meta in (deps or {}).items():
+            check(name, meta)
+            walk(meta.get("dependencies"))
+    if not lock.get("packages"):
+        walk(lock.get("dependencies"))
+    return bad
+
+
 PNPM_KEY = re.compile(r"^  '?/?([^\s:']+?)'?:\s*$")
 
 
@@ -138,8 +171,10 @@ def lockfile_versions(repo: str, ref: str, manifest: str, cache: dict):
             path = posixpath.join(base, name) if base else name
             text = gh_raw(repo, path, ref)
             if text is not None:
-                reader = npm_versions if name.endswith(".json") else pnpm_versions
-                cache[base] = (path, reader(text))
+                if name.endswith(".json"):
+                    cache[base] = (path, npm_versions(text), npm_mismatches(text))
+                else:
+                    cache[base] = (path, pnpm_versions(text), {})
                 break
     return cache[base]
 
@@ -162,11 +197,15 @@ def check(repo: str, ref: str, only: set[int] | None) -> list[dict]:
         if got is None:
             row["status"] = "unsupported"
         else:
-            row["lockfile"], versions = got
+            row["lockfile"], versions, mismatched = got
             installed = sorted(versions.get(pkg, ()), key=parse_version)
             bad = [v for v in installed if in_range(v, rng)]
             row["installed"] = installed
-            row["status"] = "vulnerable" if bad else "fixed"
+            if pkg in mismatched:
+                row["status"] = "inconsistent"
+                row["note"] = "hand-edited lockfile? " + "; ".join(mismatched[pkg])
+            else:
+                row["status"] = "vulnerable" if bad else "fixed"
             if bad:
                 row["vulnerable_versions"] = bad
         rows.append(row)
@@ -201,7 +240,7 @@ def main(argv=None) -> int:
             extra = ""
             if r["status"] == "vulnerable":
                 extra = f"  installed {', '.join(r['vulnerable_versions'])} in {r['range']!r}"
-            elif r["status"] in ("unsupported", "not open"):
+            elif r["status"] in ("unsupported", "not open", "inconsistent"):
                 extra = f"  {r.get('note', r.get('manifest', ''))}"
             print(f"#{r['alert']:<5} {r['status']:<12} {r.get('package', '')}{extra}")
         counts = {}
