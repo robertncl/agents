@@ -4,7 +4,7 @@ Claude Code subagents and supporting tooling.
 
 | Agent | Does | Writes to your repo? |
 | --- | --- | --- |
-| [`dependabot-fixer`](#dependabot-fixer) | Turns open Dependabot alerts into one fix PR per vulnerability | Branch + PR per alert (never merges) |
+| [`dependabot-fixer`](#dependabot-fixer) | Turns open Dependabot alerts into minimal fix PRs | PR per direct fix + one transitive PR per manifest (never merges) |
 | [`dependency-updater`](#dependency-updater) | Routine dependency/Action upgrades past a 24h cooloff | Branch + PR when there's anything to update (never merges) |
 | [`pr-reviewer`](#pr-reviewer) | Reviews open PRs for security + quality, posts a real GitHub review | Review comments only |
 
@@ -123,9 +123,11 @@ no-op check rather than duplicate reviews.
 
 ## dependabot-fixer
 
-Processes a repository's open Dependabot security alerts and lands **one
-branch, commit, and pull request per vulnerability**, so each fix can be
-reviewed, merged, or reverted on its own.
+Processes a repository's open Dependabot security alerts and lands the
+**smallest safe upgrade that closes each one**: one pull request per
+direct-dependency fix, so each can be reviewed, merged, or reverted on its own,
+plus one combined pull request per manifest for transitive fixes that only move
+the lockfile (separate lockfile-only PRs would conflict after the first merge).
 
 Alerts come from `gh api "/repos/{owner}/{repo}/dependabot/alerts?state=open"`
 (they aren't exposed via the GitHub MCP tools). The scope gate and the open-alert
@@ -141,12 +143,20 @@ package at a time.
 
 What it does:
 
-- Treats `first_patched_version` as a floor, then resolves the newest version
-  above it that clears the same 24h cooloff window as `dependency-updater` —
-  a CVE patch published minutes ago gets held back and surfaced as a tradeoff,
-  not adopted silently.
-- Prefers fixing transitive alerts by bumping the direct parent dependency;
-  `overrides`/`resolutions` are a last-resort stopgap and get labelled as one.
+- Treats `first_patched_version` as a floor and resolves the newest release
+  on the floor's **major line** (`batch --same-major` with the floor as
+  `@current`) that clears the same 24h cooloff window as `dependency-updater`.
+  It crosses a major only when no backport exists, and then only to the
+  floor's major. A CVE patch published minutes ago gets held back and surfaced
+  as a tradeoff, not adopted silently.
+- Fixes transitive alerts in place: a targeted lockfile update when the
+  parent's range allows it, else a same-major parent bump, else an
+  `overrides`/`resolutions` stopgap. It never adds a transitive package as a
+  direct dependency, and proves with `npm ls`/`pnpm why` that no vulnerable
+  copy remains.
+- Never uses `--legacy-peer-deps`/`--force` to get an install through, reports
+  the exact build/test commands it ran, and processes every open alert rather
+  than stopping at a self-chosen batch.
 - Re-checks the regenerated lockfile's newly added transitive entries against
   the cooloff, and pins vulnerable GitHub Actions to full commit SHAs.
 - Skips packages Dependabot already has an open PR for, and branches every fix
@@ -260,3 +270,26 @@ annotated-tag date, and release date, so a tag pointing at an old commit cannot
 understate its age.
 
 Requires Python 3.10+ and, for the `action` subcommand, an authenticated `gh`.
+
+### scripts/verify_alerts.py
+
+The dependabot-fixer's post-push check. It reads the npm or pnpm lockfile for
+each alert's manifest **from GitHub at a given ref**, not from a local
+checkout, so neither an unpushed working tree nor a sibling agent's clone can
+make a fix look done:
+
+```bash
+# every open alert against a PR branch
+scripts/verify_alerts.py robertncl/JS dependabot-fix/npm-express-and-node-fetch
+
+# only the alerts a PR claims; exit 1 if any is still vulnerable
+scripts/verify_alerts.py robertncl/node1 dependabot-fix/npm-transitive-root --alerts 1,2,5
+```
+
+Each alert is `fixed` (no installed copy, nested ones included, is inside the
+advisory's `vulnerable_version_range`), `vulnerable` (lists the offending
+versions), or `unsupported` (no npm/pnpm lockfile beside the manifest; check by
+hand). It compares against the range rather than `first_patched_version`, so a
+fix backported to an older line (picomatch 2.3.2 against a 4.0.4 floor) counts
+as fixed. Reads npm lockfile v1–v3 and pnpm v5, v6, and v9. Needs an
+authenticated `gh`.
