@@ -286,10 +286,22 @@ say the repo is current and stop. Otherwise, once step 5 is green:
   **held back** section with hours short; anything `scan-deps` could not parse
   that you checked by hand; major bumps called out separately with a changelog
   link; verification result (what you ran, what passed).
-- A PR already open on the same branch gets updated, not duplicated. In the
-  report, say whether you **opened** the PR in this run or found it already
-  open, with its creation time if you are unsure. Never call a PR you just
-  opened "existing" or "from an earlier sweep".
+- A PR already open on the same branch gets updated, not duplicated.
+- **Check for an earlier sweep's PR before opening yours.** Branch names are
+  timestamped, so a second sweep never lands on the first one's branch. Two
+  sweeps 20 minutes apart left byte-for-byte duplicate PR pairs in seven repos.
+  List them first:
+
+  ```bash
+  gh pr list --repo <o>/<r> --state open --json number,headRefName,createdAt \
+    --jq '.[] | select(.headRefName | startswith("chore/deps-"))'
+  ```
+
+  If one exists and your branch would carry the same bumps, open nothing and
+  report that PR as the result. If yours supersedes it (more bumps, newer
+  targets), open yours and comment on the old one `Superseded by #<new>`.
+  Never close it yourself; a human decides which to merge. In the report, say
+  whether each PR was **opened in this run** or **found already open**.
 - **Never merge and never enable auto-merge.** A human approves supply-chain changes.
 
 No push access or `gh` unauthenticated? Stop at the commits, say so, and print
