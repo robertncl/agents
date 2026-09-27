@@ -129,6 +129,109 @@ class TestCeilingScope(unittest.TestCase):
     def test_unceilinged_package_is_unaffected(self):
         self.assertIsNone(cooloff.ceiling_for("npm", "react", {"react"}))
 
+    def test_inert_ceiling_is_not_reported_on_the_row(self):
+        # WorldCup and bun-app are on TypeScript 7 with no trigger package.
+        # A row still carrying the ceiling got reported as "held back at
+        # major 6" for a repo that was never held back.
+        from datetime import datetime, timedelta, timezone
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        saved = cooloff.FETCHERS["npm"]
+        cooloff.FETCHERS["npm"] = lambda name, allow_prerelease=False: [("7.0.2", old)]
+        try:
+            r = cooloff.resolve_pkg("npm", "typescript", "7.0.2",
+                                    context_names={"typescript", "@types/bun"})
+        finally:
+            cooloff.FETCHERS["npm"] = saved
+        self.assertIsNone(r["ceiling"])
+        self.assertFalse(r["changed"])
+
+
+class TestNpmLatestCap(unittest.TestCase):
+    """pokedev: Expo's next-SDK modules ship plain version numbers under the
+    `next` dist-tag. Only `latest` says what npm considers released."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        ts = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        self.cands = [("57.0.15", ts), ("57.0.18", ts), ("58.0.7", ts),
+                      ("58.0.0-canary-20260909-ea7a89a", ts)]
+
+    def test_versions_above_latest_are_dropped(self):
+        out = cooloff.npm_cap_at_latest(
+            self.cands, {"latest": "57.0.18", "next": "58.0.7"})
+        self.assertEqual([v for v, _ in out], ["57.0.15", "57.0.18"])
+
+    def test_missing_or_prerelease_latest_caps_nothing(self):
+        self.assertEqual(cooloff.npm_cap_at_latest(self.cands, {}), self.cands)
+        self.assertEqual(
+            cooloff.npm_cap_at_latest(self.cands, {"latest": "1.0.0-rc.1"}), self.cands)
+
+
+class TestMavenPrerelease(unittest.TestCase):
+    def test_milestones_and_candidates_are_not_stable(self):
+        # spring-boot-starter-* 4.2.0-M2 read as the newest stable release.
+        for v in ("4.2.0-M2", "5.13.0-M3", "1.0.0-CR1", "1.0.0-RC2"):
+            self.assertFalse(cooloff.is_stable(v), v)
+        for v in ("3.5.3", "2.6.0", "6.5.6"):
+            self.assertTrue(cooloff.is_stable(v), v)
+
+
+class TestPomScan(unittest.TestCase):
+    """payment: every pin sat behind a property or in <parent>/<plugin>, so
+    the old scan found nothing it could resolve."""
+
+    POM = """<project>
+  <parent>
+    <groupId>com.alipay.sofa</groupId>
+    <artifactId>sofaboot-dependencies</artifactId>
+    <version>4.6.0</version>
+  </parent>
+  <groupId>io.paylab</groupId>
+  <version>0.1.0-SNAPSHOT</version>
+  <properties>
+    <seata.version>2.6.0</seata.version>
+    <spotless.version>3.10.2</spotless.version>
+  </properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>io.paylab</groupId><artifactId>paylab-common</artifactId>
+      <version>${project.version}</version></dependency>
+    <dependency><groupId>org.apache.seata</groupId><artifactId>seata-sofa-rpc</artifactId>
+      <version>${seata.version}</version></dependency>
+    <!-- <dependency><groupId>x</groupId><artifactId>commented</artifactId><version>1</version></dependency> -->
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>com.alipay.sofa</groupId><artifactId>rpc-sofa-boot-starter</artifactId></dependency>
+    <dependency><groupId>a.b</groupId><artifactId>undefined-prop</artifactId>
+      <version>${nowhere.version}</version></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>com.diffplug.spotless</groupId><artifactId>spotless-maven-plugin</artifactId>
+      <version>${spotless.version}</version>
+      <configuration><java><version>9.9</version></java></configuration></plugin>
+    <plugin><artifactId>maven-surefire-plugin</artifactId></plugin>
+    <plugin><artifactId>maven-jar-plugin</artifactId><version>3.4.2</version></plugin>
+  </plugins></build>
+</project>"""
+
+    def test_properties_parent_and_plugins(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "pom.xml")
+        with open(path, "w") as f:
+            f.write(self.POM)
+        out, notes = [], []
+        cooloff._deps_pom(path, d, out, notes)
+        got = {r["name"]: r["current"] for r in out}
+        self.assertEqual(got, {
+            "com.alipay.sofa:sofaboot-dependencies": "4.6.0",
+            "org.apache.seata:seata-sofa-rpc": "2.6.0",
+            "com.diffplug.spotless:spotless-maven-plugin": "3.10.2",
+            "org.apache.maven.plugins:maven-jar-plugin": "3.4.2",
+        })
+        # Undefined property: reported for a hand check, never guessed.
+        self.assertEqual(len(notes), 1)
+        self.assertIn("${nowhere.version}", notes[0])
+
 
 class TestVersionEquality(unittest.TestCase):
     """Go pins carry a `v`; npm pins carry range operators. Neither is a change."""
