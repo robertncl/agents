@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import email.utils
 import json
 import os
 import re
@@ -115,7 +116,10 @@ _PRERELEASE_WORDS = ("alpha", "beta", "rc", "dev", "pre", "canary", "next", "nig
 # PEP 440 spells prereleases as bare letters -- 2.14.0a1, 2.0.0b2, 1.5c3 -- which
 # no keyword above would catch. Without this, an alpha reads as stable and
 # slips into a sweep that was supposed to exclude prereleases.
-_PRERELEASE_RE = re.compile(r"^[._-]?(?:a|b|c|rc|alpha|beta|pre|preview|dev)[._-]?\d*$", re.I)
+# Maven spells milestones and candidate releases `-M2` / `-CR1`
+# (spring-boot 4.2.0-M2, junit 5.13.0-M3); without them a milestone read as
+# the newest stable release.
+_PRERELEASE_RE = re.compile(r"^[._-]?(?:a|b|c|rc|cr|m|alpha|beta|pre|preview|dev|milestone)[._-]?\d*$", re.I)
 
 
 def parse_version(raw: str):
@@ -281,7 +285,26 @@ def die(msg: str, code: int = 1):
 # --------------------------------------------------------------------------
 
 
-def versions_npm(name: str):
+def npm_cap_at_latest(candidates, dist_tags):
+    """Drop versions newer than the `latest` dist-tag.
+
+    A version number alone does not say whether npm considers it released.
+    Expo publishes the next SDK's modules as plain `58.0.7` under the `next`
+    tag while `latest` still points at 57.x, so a stable-looking number is
+    really a preview. Picking it put pokedev on SDK 58 modules against an
+    SDK 57 `expo`. `latest` is what `npm install <pkg>` installs, so nothing
+    above it counts as released. A `latest` tag we cannot parse, or one
+    that is itself a prerelease, caps nothing.
+    """
+    latest = (dist_tags or {}).get("latest")
+    if not latest or parse_version(latest) is None or not is_stable(latest):
+        return candidates
+    cap = sort_key(latest)
+    return [(v, ts) for v, ts in candidates
+            if parse_version(v) is None or sort_key(v) <= cap]
+
+
+def versions_npm(name: str, allow_prerelease: bool = False):
     url = f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}"
     data = fetch_json(url)
     times = data.get("time", {})
@@ -319,6 +342,8 @@ def versions_npm(name: str):
         ts = parse_ts(times.get(ver, ""))
         if ts:
             out.append((ver, ts))
+    if not allow_prerelease:
+        out = npm_cap_at_latest(out, data.get("dist-tags"))
     return out
 
 
@@ -388,14 +413,44 @@ def versions_maven(name: str):
         die("maven packages must be given as group:artifact")
     group, artifact = name.split(":", 1)
     q = urllib.parse.quote(f'g:"{group}" AND a:"{artifact}"')
-    data = fetch_json(
-        f"https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=200&wt=json"
-    )
     out = []
-    for doc in data.get("response", {}).get("docs") or []:
-        ts = doc.get("timestamp")
-        if ts:
-            out.append((doc["v"], datetime.fromtimestamp(ts / 1000, tz=timezone.utc)))
+    try:
+        data = fetch_json(
+            f"https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=200&wt=json"
+        )
+        for doc in data.get("response", {}).get("docs") or []:
+            ts = doc.get("timestamp")
+            if ts:
+                out.append((doc["v"], datetime.fromtimestamp(ts / 1000, tz=timezone.utc)))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        pass
+    # search.maven.org times out often and lags new releases; it left payment's
+    # whole sweep unresolved. The repository itself is authoritative.
+    return out or _versions_maven_repo(group, artifact)
+
+
+def _versions_maven_repo(group, artifact, probe=15):
+    """Versions from maven-metadata.xml, dated by each POM's Last-Modified.
+
+    Only the newest `probe` versions are dated (one HEAD request each) --
+    enough to find the newest one that clears the window.
+    """
+    base = f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}"
+    xml = fetch_text(f"{base}/maven-metadata.xml")
+    versions = re.findall(r"<version>([^<]+)</version>", xml)
+    versions = [v for v in versions if parse_version(v) is not None]
+    versions.sort(key=sort_key, reverse=True)
+    out = []
+    for v in versions[:probe]:
+        req = urllib.request.Request(f"{base}/{v}/{artifact}-{v}.pom", method="HEAD",
+                                     headers={"User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                lm = resp.headers.get("Last-Modified")
+        except urllib.error.URLError:
+            continue
+        if lm:
+            out.append((v, email.utils.parsedate_to_datetime(lm).astimezone(timezone.utc)))
     return out
 
 
@@ -882,7 +937,10 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
                 context_names=None):
     fetcher = FETCHERS[ecosystem]
     try:
-        candidates = fetcher(name)
+        if ecosystem == "npm":
+            candidates = fetcher(name, allow_prerelease=allow_prerelease)
+        else:
+            candidates = fetcher(name)
     except urllib.error.HTTPError as e:
         raise ResolveError(f"{ecosystem}:{name}: HTTP {e.code}")
     except urllib.error.URLError as e:
@@ -916,7 +974,11 @@ def resolve_pkg(ecosystem, name, current=None, hours=DEFAULT_HOURS,
         "changed": bool(current) and not same_version(current, chosen["version"]),
         "skipped_too_new": skipped,
         "versions_considered": len(considered),
-        "ceiling": ceiling,
+        # Only a ceiling that actually constrained selection belongs on the
+        # row. An inert one (its trigger packages absent) still read as "held
+        # back at major 6" in WorldCup's and bun-app's reports, for repos
+        # already on TypeScript 7.
+        "ceiling": ceiling if ceiling and ceiling["applied"] else None,
     }
 
 
@@ -1085,22 +1147,64 @@ def _deps_csproj(path, root, out, notes):
                         "file": _rel(root, path)})
 
 
+_POM_PROP_RE = re.compile(r"^\$\{([^}]+)\}$")
+
+
 def _deps_pom(path, root, out, notes):
+    """Dependencies, plugins and the parent POM, with `${prop}` versions
+    resolved from this file's own <properties>.
+
+    Real POMs keep most pins in properties (`<seata.version>2.6.0`), and a
+    SOFABoot/Spring Boot project's biggest pin is its <parent>. Scanning
+    only literal <dependency> versions left payment with nothing to resolve.
+    """
     text = open(path, encoding="utf-8", errors="replace").read()
-    for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.S):
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    props = {}
+    for block in re.findall(r"<properties>(.*?)</properties>", text, re.S):
+        for k, v in re.findall(r"<([A-Za-z0-9_.\-]+)>([^<]*)</\1>", block):
+            props[k] = v.strip()
+
+    def emit(block, default_group=None):
         g = re.search(r"<groupId>([^<]+)</groupId>", block)
         a = re.search(r"<artifactId>([^<]+)</artifactId>", block)
         v = re.search(r"<version>([^<]+)</version>", block)
-        if not (g and a):
-            continue
+        group = g.group(1).strip() if g else default_group
+        if not (group and a):
+            return
+        name = f"{group}:{a.group(1).strip()}"
         version = v.group(1).strip() if v else None
-        if version and version.startswith("${"):
-            # Resolved from a <properties> block; report it rather than
-            # guessing at the indirection.
-            notes.append(f"{_rel(root, path)}: {g.group(1)}:{a.group(1)} version is a property ({version})")
-            version = None
-        out.append({"ecosystem": "maven", "name": f"{g.group(1).strip()}:{a.group(1).strip()}",
+        if not version:
+            # Managed by the parent/BOM: there is no pin here to update, and
+            # proposing Central's newest is how the wrong line gets pinned
+            # (payment's rpc-sofa-boot-starter resolves to a Spring Boot 2
+            # 6.0.4 that breaks the build).
+            return
+        m = _POM_PROP_RE.match(version or "")
+        if m:
+            key = m.group(1)
+            if key in ("project.version", "project.parent.version"):
+                return  # a module of this build, not a published artifact
+            if key not in props:
+                notes.append(f"{_rel(root, path)}: {name} version is a property "
+                             f"({version}) not defined in this pom -- check by hand")
+                return
+            version = props[key]
+        if version and ("${" in version or version.endswith("-SNAPSHOT")):
+            return  # unresolvable indirection, or an unpublished local build
+        out.append({"ecosystem": "maven", "name": name,
                     "current": _clean_version(version), "file": _rel(root, path)})
+
+    for block in re.findall(r"<parent>(.*?)</parent>", text, re.S):
+        emit(block)
+    for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.S):
+        emit(block)
+    for block in re.findall(r"<plugin>(.*?)</plugin>", text, re.S):
+        # A plugin nests <dependencies> of its own; those were picked up
+        # above, so read the plugin's coordinates from outside that block.
+        head = re.sub(r"<dependencies>.*?</dependencies>", "", block, flags=re.S)
+        head = re.sub(r"<configuration>.*?</configuration>", "", head, flags=re.S)
+        emit(head, default_group="org.apache.maven.plugins")
 
 
 _MANIFESTS = [

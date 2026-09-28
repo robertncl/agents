@@ -57,13 +57,18 @@ scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json
 `scan-deps` covers `package.json`, `requirements*.txt`, `pyproject.toml`,
 `go.mod`, `Cargo.toml`, `Gemfile`, `pom.xml`, `*.csproj`, and every `uses:`
 under `.github/workflows` and `.github/actions`. It deduplicates across
-manifests, so one sweep from the root also covers a monorepo.
+manifests, so one sweep from the root also covers a monorepo. For `pom.xml` it
+reads `<parent>`, dependencies and plugins, and resolves `${prop}` versions
+from the POM's own `<properties>`. Versions with no pin in the repo (managed by
+a parent BOM, `${project.version}`, `-SNAPSHOT`) are deliberately skipped.
+Never pin one of those yourself. The BOM chose it, and Central's newest can
+belong to a different, incompatible line.
 
 Each `batch` row carries a `status`:
 
 | status | Meaning | What you do |
 | --- | --- | --- |
-| `update` | Newer version cleared the window | **Your work list.** Apply it. |
+| `update` | Newer version cleared the window | **Your work list.** Apply it (subject to the SDK rule in step 5). |
 | `current` | Already on target | Nothing. |
 | `resolved` | No pinned version to compare | Decide whether to pin; report. |
 | `held_back` | Newer version inside the window | **Not an error.** Keep current, report hours short. |
@@ -71,6 +76,10 @@ Each `batch` row carries a `status`:
 | `above_ceiling` | The pin is newer than a `VERSION_CEILING` allows | **Never downgrade.** Keep the pin, report the ceiling's `reason`. |
 | `ahead` | The pin is newer than anything selectable, with no ceiling in play | Keep the pin. Usually a placeholder release (react-native's `1000.0.0`). |
 | `error` | 404 / bad spec / network | Retry with `pkg` or `action`, then report by hand. |
+
+A row's `ceiling` field is set only when a ceiling actually constrained that
+row. `ceiling: null` means no ceiling applied. Never report a package as
+"held back by a ceiling" unless its row has a non-null `ceiling`.
 
 `batch` exits 3 if any row errored, but every other row still resolved — read
 the output, don't react to the exit code.
@@ -81,6 +90,12 @@ before trusting the bump.
 
 Flags: `--hours N` (window), `--same-major`, `--allow-prerelease` (off by
 default), `-j N` (concurrency, default 8). `$COOLOFF_HOURS` sets the default.
+
+For npm, the resolver never selects a version newer than the package's
+`latest` dist-tag, even if the number looks stable. Expo publishes the next
+SDK's modules as plain `58.0.7` under `next` while `latest` is still 57.x.
+`--allow-prerelease` lifts that cap as well; use it only when the user asks.
+Never hand-pick a version from a `next`, `canary` or `beta` tag.
 
 Spot checks for anything `scan-deps` could not parse:
 
@@ -97,8 +112,9 @@ coverage is worse than a slow sweep.
 
 ## Procedure
 
-**1. Gate and branch.** Run the scope gate above. Clone if given a URL. Create
-a branch — never work on the default branch.
+**1. Gate and branch.** Run the scope gate above. Clone if given a URL. Record
+the branch the checkout is on (`git branch --show-current`), then create a
+branch — never work on the default branch.
 
 Cut the branch from the **remote** default branch, never from whatever the
 checkout happens to be sitting on. A local checkout is routinely parked on a
@@ -132,7 +148,11 @@ scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > "$SCR
   a path inside the target repo, where the file would get committed. Write the
   literal path in each command — shell variables do not survive between calls.
 - Output `[]` means the repo has nothing to resolve: report it current and stop.
-- No `update` rows: report current and stop. No branch, no install, no PR.
+- No `update` rows: report current and stop. No install, no PR, and **no
+  leftover branch**: switch back to the branch you recorded in step 1 and
+  delete the one you created (`git checkout <start> && git branch -D <yours>`).
+  Past sweeps left checkouts parked on empty `chore/deps-*` branches. Do the
+  same whenever you end a repo with nothing committed.
 - Everything below edits files to match decisions this step already made. Do
   not re-run `scan-deps` to "check", do not re-query per package with `pkg`,
   `npm view`, or a hand-written registry fetch, and do not re-run the sweep
@@ -210,8 +230,24 @@ integrity hashes.
 - Always regenerate and commit the lockfile (`package-lock.json`,
   `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `Cargo.lock`, `Gemfile.lock`,
   `go.sum`). The lockfile is what pins the transitive tree.
+- **Every manifest you edit has its own lockfile.** A nested app (`mobile/`,
+  `web/`, `apps/*`) with its own `package-lock.json` is not covered by an
+  install at the root. Run the install in the directory of each edited
+  manifest. Before committing, check that every edited manifest has a
+  modified lockfile next to it:
+
+  ```bash
+  for m in $(git diff --name-only | grep -E '(^|/)package\.json$'); do
+    d=$(dirname "$m"); l="$d/package-lock.json"
+    git ls-files --error-unmatch "$l" >/dev/null 2>&1 || continue  # workspace: root lock
+    git diff --quiet -- "$l" && echo "LOCKFILE NOT REGENERATED: $l"
+  done
+  ```
+
+  Any output means the PR would fail `npm ci` in that directory. pokedev#21
+  shipped exactly that for `mobile/`.
 - Prove it is coherent with a lockfile-respecting install (`npm ci`,
-  `uv sync --frozen`).
+  `uv sync --frozen`) **in each of those directories**.
 - **Transitive dependencies need the cooloff too.** A clean direct upgrade can
   pull in a brand-new sub-dependency — this is where real attacks land. Diff the
   regenerated lockfile, collect every added or bumped entry, check them as **one
@@ -224,10 +260,21 @@ integrity hashes.
   Anything `held_back` here means backing the direct upgrade that pulled it in
   out of this sweep.
 
-**5. Verify.** Run the repo's build and tests. No test suite? Say so plainly
-rather than implying the change is validated. Report failures with actual
-output. Never open a PR on a red build — fix it or drop the offending upgrade,
-and say which.
+**5. Verify.** Run the repo's build and tests, in every directory whose
+manifest changed. No test suite? Say so plainly rather than implying the
+change is validated.
+
+**SDK-managed versions move with the SDK, not individually.** Some frameworks
+dictate the exact versions of a family of packages. Bumping one of them
+independently installs cleanly and passes web tests, then breaks at runtime.
+If a directory's `package.json` depends on `expo`, run `npx expo install
+--check` there after installing. For every package it flags (react-native,
+react, expo-*, jest-expo, jest, async-storage, …), revert your bump to the
+version the check expects. Moving to a new Expo SDK is never a routine bump:
+leave `expo`'s major alone and report that a new SDK is available.
+
+Report failures with actual output. Never open a PR on a red build — fix it or
+drop the offending upgrade, and say which.
 
 **6. Open a PR when anything changed.** No `update` rows means nothing to open:
 say the repo is current and stop. Otherwise, once step 5 is green:
@@ -240,6 +287,21 @@ say the repo is current and stop. Otherwise, once step 5 is green:
   that you checked by hand; major bumps called out separately with a changelog
   link; verification result (what you ran, what passed).
 - A PR already open on the same branch gets updated, not duplicated.
+- **Check for an earlier sweep's PR before opening yours.** Branch names are
+  timestamped, so a second sweep never lands on the first one's branch. Two
+  sweeps 20 minutes apart left byte-for-byte duplicate PR pairs in seven repos.
+  List them first:
+
+  ```bash
+  gh pr list --repo <o>/<r> --state open --json number,headRefName,createdAt \
+    --jq '.[] | select(.headRefName | startswith("chore/deps-"))'
+  ```
+
+  If one exists and your branch would carry the same bumps, open nothing and
+  report that PR as the result. If yours supersedes it (more bumps, newer
+  targets), open yours and comment on the old one `Superseded by #<new>`.
+  Never close it yourself; a human decides which to merge. In the report, say
+  whether each PR was **opened in this run** or **found already open**.
 - **Never merge and never enable auto-merge.** A human approves supply-chain changes.
 
 No push access or `gh` unauthenticated? Stop at the commits, say so, and print
