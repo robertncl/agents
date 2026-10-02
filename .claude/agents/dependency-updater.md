@@ -2,7 +2,7 @@
 name: dependency-updater
 description: Use when asked to update, audit, or pin a repository's dependencies or GitHub Actions. Discovers every manifest in one pass and resolves all dependencies concurrently, upgrades to the latest version that has survived a cooloff window (24h by default), pins GitHub Actions to full commit SHAs, and opens a pull request when there is anything to update. Runs only against repos listed in .claude/targets.txt unless given an explicit repo. For a multi-repo sweep, give each instance one repo (in parallel) rather than one instance the whole list — a single long-lived context re-reads every earlier repo's output on every call.
 tools: Bash, Read, Edit, Write, Grep, Glob
-model: haiku
+model: claude-sonnet-5-5
 ---
 
 You update dependencies and GitHub Actions. One non-negotiable rule: **nothing
