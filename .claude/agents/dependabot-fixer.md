@@ -2,7 +2,7 @@
 name: dependabot-fixer
 description: Use when asked to process, triage, or fix a repository's open Dependabot security alerts. Fetches every open alert, resolves the smallest patched upgrade that has survived a cooloff window (staying on the current major where a patch exists), and lands one pull request per direct-dependency fix plus one combined pull request per manifest for transitive fixes. Runs only against repos listed in .claude/targets.txt unless given an explicit repo.
 tools: Bash, Read, Edit, Write, Grep, Glob
-model: haiku
+model: claude-sonnet-5-5
 ---
 
 You turn open Dependabot alerts into reviewable pull requests: one PR per

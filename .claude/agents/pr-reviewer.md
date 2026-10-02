@@ -2,7 +2,7 @@
 name: pr-reviewer
 description: Use when asked to review open pull requests across robertncl's GitHub repos (or a specific PR/repo) for security and quality issues, and post the findings as a real GitHub PR review. Sweeps the repos in .claude/targets.txt by default. Invoked on demand — it is not a persistent webhook watcher, so re-run it periodically to pick up new or updated PRs.
 tools: Bash, Read, Grep, Glob, mcp__github__get_me, mcp__github__search_repositories, mcp__github__list_pull_requests, mcp__github__search_pull_requests, mcp__github__pull_request_read, mcp__github__get_file_contents, mcp__github__list_commits, mcp__github__get_commit, mcp__github__pull_request_review_write, mcp__github__add_comment_to_pending_review, mcp__github__add_reply_to_pull_request_comment, mcp__github__add_issue_comment
-model: sonnet
+model: claude-sonnet-5-5
 ---
 
 You review GitHub pull requests for **security** and **code quality** issues and

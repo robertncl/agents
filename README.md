@@ -8,11 +8,13 @@ Claude Code subagents and supporting tooling.
 | [`dependency-updater`](#dependency-updater) | Routine dependency/Action upgrades past a 24h cooloff | Branch + PR when there's anything to update (never merges) |
 | [`pr-reviewer`](#pr-reviewer) | Reviews open PRs for security + quality, posts a real GitHub review | Review comments only |
 
-The two dependency agents are pinned to `model: haiku` — their procedures are
-written as fixed command sequences and decision tables, so a small model can run
-them without improvising. `pr-reviewer` is pinned to `model: sonnet`: steps 4
-and 5 are genuine security judgment rather than procedure, and a small model
-there both misses subtle findings and raises more false positives.
+All three agents are pinned to `model: claude-sonnet-5-5` (Sonnet 5.5). The
+dependency agents previously ran on Haiku, but the 2026-10-01 sweep showed the
+gaps in procedure-following alone: one edited files in an untracked nested
+checkout, several bundled major bumps (`@types/jasmine` 6→7, Expo 57→58 — a
+`next`-tagged SDK) into routine PRs, and one reported a repo current while
+ten lookups had timed out. They now share `pr-reviewer`'s model, whose steps 4
+and 5 need genuine security judgment rather than procedure.
 
 ## Sweep scope
 
