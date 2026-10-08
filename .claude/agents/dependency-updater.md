@@ -144,9 +144,16 @@ the JSON to a file — every later step reads that file:
 scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > "$SCRATCH/batch.json"
 ```
 
-- `$SCRATCH` stands for your scratchpad directory (or `/tmp/deps-<repo>`), never
-  a path inside the target repo, where the file would get committed. Write the
-  literal path in each command — shell variables do not survive between calls.
+- `$SCRATCH` stands for a directory unique to this repo *and* this run — never
+  the bare scratchpad, and never a path inside the target repo, where the file
+  would get committed. Several instances of you often run in parallel and share
+  one scratchpad: a sweep that wrote `<scratchpad>/batch.json` from 20 agents at
+  once left each reading its siblings' rows (a `minifb` crate row in an Actions-
+  only repo, `cors` in a repo without it, truncated JSON). Create it once:
+  `mktemp -d "<scratchpad>/deps-<repo>-XXXXXX"` (or under `${TMPDIR:-/tmp}`),
+  then write that literal path in each command — shell variables do not
+  survive between calls. Keep every other file you write (PR bodies, logs,
+  clones) inside it too.
 - Output `[]` means the repo has nothing to resolve: report it current and stop.
 - No `update` rows: report current and stop. No install, no PR, and **no
   leftover branch**: switch back to the branch you recorded in step 1 and
@@ -357,4 +364,5 @@ Each of these cost repeated failed calls in past sweeps.
   after pushing, take at most one `gh pr checks <n> --repo <o>/<r>` snapshot and
   report anything still pending.
 - Paths under `/tmp/<repo>` from an earlier run are stale clones. Work in the
-  checkout you gated, or a fresh clone.
+  checkout you gated, or a fresh clone inside your own `$SCRATCH` (step 2) —
+  never a generic `<scratchpad>/<repo>` a sibling instance may also be using.
