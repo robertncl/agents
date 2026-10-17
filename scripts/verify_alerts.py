@@ -12,12 +12,21 @@ neither mistake can make it pass.
 For every open alert (or only those listed in --alerts) it reports:
   fixed        no installed copy of the package is inside the vulnerable range
   vulnerable   at least one installed copy still is (versions listed)
-  unsupported  no npm/pnpm lockfile beside the manifest; verify by hand
+  unconfirmed  nothing installed is inside the range, but the advisory names
+               no patched version -- every release up to the newest was
+               vulnerable when it was published, so a newer one falling
+               outside `<= X` is not evidence of a fix
+  unsupported  no lockfile this script reads for the alert's ecosystem;
+               verify by hand
   inconsistent a lockfile entry's `version` disagrees with its `resolved`
                tarball -- hand-edited; npm still installs the old code
 
+Reads npm (package-lock.json, pnpm-lock.yaml) and pip (a pinned
+requirements*.txt manifest itself, else poetry.lock / uv.lock / Pipfile.lock
+beside it). A lockfile is only ever read for its own ecosystem's alerts.
+
 Exit 0 when every checked alert is fixed, 1 when any is vulnerable,
-inconsistent, or unsupported, 2 on usage or API errors.
+unconfirmed, inconsistent, or unsupported, 2 on usage or API errors.
 """
 
 from __future__ import annotations
@@ -29,7 +38,10 @@ import re
 import subprocess
 import sys
 
-LOCKFILES = ("package-lock.json", "pnpm-lock.yaml")
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    tomllib = None
 
 
 def open_alerts(repo: str) -> list[dict]:
@@ -54,9 +66,16 @@ def gh_raw(repo: str, path: str, ref: str) -> str | None:
 # --- versions and advisory ranges -------------------------------------------
 
 def parse_version(v: str) -> tuple:
-    """Semver-ish key. A prerelease sorts before its release."""
+    """Semver-ish key. A prerelease sorts before its release.
+
+    Also reads PEP 440's unseparated suffixes (`2.0.0rc1`), which the split
+    on `-` alone took for the final release.
+    """
     v = v.strip().lstrip("v").split("+", 1)[0]
-    core, _, pre = v.partition("-")
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)$", v)
+    core, pre = (m.group(1), m.group(2).lstrip("-._")) if m else (v, "")
+    if re.match(r"(post|rev|r)\d*$", pre, re.I):  # 1.0.post1 is after 1.0
+        pre = ""
     nums = [int(x) if x.isdigit() else 0 for x in core.split(".")]
     nums = (nums + [0, 0, 0])[:3]
     return (*nums, 0 if pre else 1, pre)
@@ -162,21 +181,95 @@ def pnpm_versions(text: str) -> dict[str, set[str]]:
     return found
 
 
-def lockfile_versions(repo: str, ref: str, manifest: str, cache: dict):
-    """Versions from the npm/pnpm lockfile beside an alert's manifest_path."""
+def pip_name(name: str) -> str:
+    """PEP 503 normalisation: `PyYAML`, `pyyaml` and `py_yaml` are one project."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+REQ_PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*===?\s*([^\s;\\]+)")
+
+
+def requirements_versions(text: str) -> dict[str, set[str]]:
+    """`name==version` pins from a requirements file (pip-compile output too:
+    hash continuation lines and `# via` comments carry no pin)."""
+    found: dict[str, set[str]] = {}
+    for line in text.splitlines():
+        m = REQ_PIN.match(line.split("#", 1)[0].strip())
+        if m:
+            found.setdefault(pip_name(m.group(1)), set()).add(m.group(2))
+    return found
+
+
+def toml_lock_versions(text: str) -> dict[str, set[str]]:
+    """`[[package]]` name/version pairs from poetry.lock or uv.lock."""
+    found: dict[str, set[str]] = {}
+    if tomllib is not None:
+        for pkg in tomllib.loads(text).get("package") or []:
+            if pkg.get("name") and pkg.get("version"):
+                found.setdefault(pip_name(pkg["name"]), set()).add(str(pkg["version"]))
+        return found
+    name = None
+    for line in text.splitlines():
+        if line.strip() == "[[package]]":
+            name = None
+        m = re.match(r'^(name|version)\s*=\s*"([^"]+)"', line)
+        if m and m.group(1) == "name":
+            name = m.group(2)
+        elif m and name:
+            found.setdefault(pip_name(name), set()).add(m.group(2))
+            name = None
+    return found
+
+
+def pipfile_lock_versions(text: str) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
+    lock = json.loads(text)
+    for section in ("default", "develop"):
+        for name, meta in (lock.get(section) or {}).items():
+            ver = str((meta or {}).get("version") or "").lstrip("=")
+            if ver:
+                found.setdefault(pip_name(name), set()).add(ver)
+    return found
+
+
+def _candidates(ecosystem: str, manifest: str):
+    """(path, reader) pairs to try for an alert, in order of preference."""
     base = posixpath.dirname(manifest)
-    if base not in cache:
-        cache[base] = None
-        for name in LOCKFILES:
-            path = posixpath.join(base, name) if base else name
+    join = lambda n: posixpath.join(base, n) if base else n  # noqa: E731
+    if ecosystem == "npm":
+        return [(join("package-lock.json"), "npm"), (join("pnpm-lock.yaml"), "pnpm")]
+    if ecosystem == "pip":
+        if manifest.endswith(".txt"):  # the compiled requirements file is the lock
+            return [(manifest, "requirements")]
+        return [(join("poetry.lock"), "toml"), (join("uv.lock"), "toml"),
+                (join("Pipfile.lock"), "pipfile")]
+    # Never read another ecosystem's lockfile: a Python or Rust package is
+    # absent from package-lock.json, and absent read as "fixed".
+    return []
+
+
+READERS = {
+    "npm": lambda t: (npm_versions(t), npm_mismatches(t)),
+    "pnpm": lambda t: (pnpm_versions(t), {}),
+    "requirements": lambda t: (requirements_versions(t), {}),
+    "toml": lambda t: (toml_lock_versions(t), {}),
+    "pipfile": lambda t: (pipfile_lock_versions(t), {}),
+}
+
+
+def lockfile_versions(repo: str, ref: str, ecosystem: str, manifest: str, cache: dict):
+    """Versions from the lockfile that pins an alert's manifest_path."""
+    candidates = _candidates(ecosystem, manifest)
+    key = tuple(candidates)
+    if key not in cache:
+        cache[key] = None
+        for path, reader in candidates:
             text = gh_raw(repo, path, ref)
             if text is not None:
-                if name.endswith(".json"):
-                    cache[base] = (path, npm_versions(text), npm_mismatches(text))
-                else:
-                    cache[base] = (path, pnpm_versions(text), {})
+                versions, mismatched = READERS[reader](text)
+                cache[key] = (path, versions, mismatched)
                 break
-    return cache[base]
+    return cache[key]
 
 
 # --- main --------------------------------------------------------------------
@@ -190,22 +283,39 @@ def check(repo: str, ref: str, only: set[int] | None) -> list[dict]:
         if only is not None and n not in only:
             continue
         pkg = a["dependency"]["package"]["name"]
-        rng = a["security_vulnerability"]["vulnerable_version_range"]
-        row = {"alert": n, "package": pkg, "range": rng,
-               "manifest": a["dependency"]["manifest_path"]}
-        got = lockfile_versions(repo, ref, row["manifest"], cache)
+        eco = a["dependency"]["package"]["ecosystem"]
+        vuln = a["security_vulnerability"]
+        rng = vuln["vulnerable_version_range"]
+        patched = (vuln.get("first_patched_version") or {}).get("identifier")
+        row = {"alert": n, "package": pkg, "ecosystem": eco, "range": rng,
+               "patched": patched, "manifest": a["dependency"]["manifest_path"]}
+        got = lockfile_versions(repo, ref, eco, row["manifest"], cache)
         if got is None:
             row["status"] = "unsupported"
+            row["note"] = f"no {eco} lockfile this script reads beside {row['manifest']}"
         else:
             row["lockfile"], versions, mismatched = got
-            installed = sorted(versions.get(pkg, ()), key=parse_version)
+            key = pip_name(pkg) if eco == "pip" else pkg
+            installed = sorted(versions.get(key, ()), key=parse_version)
             bad = [v for v in installed if in_range(v, rng)]
             row["installed"] = installed
-            if pkg in mismatched:
+            if key in mismatched:
                 row["status"] = "inconsistent"
-                row["note"] = "hand-edited lockfile? " + "; ".join(mismatched[pkg])
+                row["note"] = "hand-edited lockfile? " + "; ".join(mismatched[key])
+            elif bad:
+                row["status"] = "vulnerable"
+            elif not installed:
+                row["status"] = "fixed"
+                row["note"] = f"no longer in {row['lockfile']}"
+            elif not patched:
+                # astro#20 and #21 both "fixed" GHSA-ch52-4w7c-c8xp by moving
+                # http-cache-semantics to 4.3.0, the first release above the
+                # advisory's `<= 4.2.0`. 4.3.0 only changed Vary handling.
+                row["status"] = "unconfirmed"
+                row["note"] = (f"advisory names no patched version; being outside {rng!r} "
+                               "is not a fix -- cite the upstream fix or report no fix available")
             else:
-                row["status"] = "vulnerable" if bad else "fixed"
+                row["status"] = "fixed"
             if bad:
                 row["vulnerable_versions"] = bad
         rows.append(row)
@@ -240,14 +350,18 @@ def main(argv=None) -> int:
             extra = ""
             if r["status"] == "vulnerable":
                 extra = f"  installed {', '.join(r['vulnerable_versions'])} in {r['range']!r}"
-            elif r["status"] in ("unsupported", "not open", "inconsistent"):
+            elif r["status"] in ("unsupported", "not open", "inconsistent", "unconfirmed"):
                 extra = f"  {r.get('note', r.get('manifest', ''))}"
             print(f"#{r['alert']:<5} {r['status']:<12} {r.get('package', '')}{extra}")
         counts = {}
         for r in rows:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
-        print(f"{args.repo}@{args.ref}: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
-              + f" of {len(rows)} checked")
+        if not rows:
+            print(f"{args.repo}@{args.ref}: no open alerts")
+        else:
+            print(f"{args.repo}@{args.ref}: "
+                  + ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+                  + f" of {len(rows)} checked")
     return 0 if all(r["status"] == "fixed" for r in rows) else 1
 
 

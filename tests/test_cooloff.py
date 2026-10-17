@@ -335,6 +335,250 @@ class TestPinActions(unittest.TestCase):
         self.assertEqual(changes, [])
         self.assertEqual(len(mismatches), 1)
 
+    def test_skip_majors_leaves_a_major_for_its_own_pr(self):
+        # gh-action-demo: download-provisioning-profiles v6.1.0 -> v7.0.0 had
+        # to be filtered out of batch.json by hand to keep it out of a patch PR.
+        rows = [
+            {"kind": "action", "repo": "actions/checkout", "tag": "v5.0.1",
+             "sha": self.NEW, "status": "update"},
+            {"kind": "action", "repo": "github/codeql-action", "tag": "v4.2.0",
+             "sha": self.NEW, "status": "update"},
+        ]
+        changes, _, left = cooloff.plan_pins(self.root, rows, skip_majors=True)
+        self.assertEqual([c["uses"].split("@")[0] for c in changes], ["github/codeql-action/init"])
+        majors = [f for f in left if f.get("major_to")]
+        self.assertEqual([(f["uses"], f["major_to"]) for f in majors],
+                         [("actions/checkout@v4", "v5.0.1")])
+        # Without the flag the major is applied, as before.
+        changes, _, _ = cooloff.plan_pins(self.root, rows)
+        self.assertEqual(len(changes), 2)
+
+
+class TestRowShape(unittest.TestCase):
+    """vue-demo, 2026-10-14: `r['name']` raised KeyError at the first action
+    row, the agent then printed only non-update rows, never saw the
+    scorecard-action bump, and its PR said "No actions to pin"."""
+
+    def setUp(self):
+        self.saved = (cooloff.resolve_action, cooloff.resolve_pkg)
+
+    def tearDown(self):
+        cooloff.resolve_action, cooloff.resolve_pkg = self.saved
+
+    def test_action_row_carries_package_keys(self):
+        cooloff.resolve_action = lambda *a, **k: {
+            "kind": "action", "repo": "ossf/scorecard-action", "current": "v2.4.4",
+            "tag": "v2.5.0", "sha": "f" * 40, "age_hours": 57.0, "changed": True,
+            "skipped_too_new": []}
+        r = cooloff.resolve_spec("action:ossf/scorecard-action@v2.4.4", 24, False, False, 10)
+        self.assertEqual((r["ecosystem"], r["name"], r["current"], r["target"], r["status"]),
+                         ("action", "ossf/scorecard-action", "v2.4.4", "v2.5.0", "update"))
+
+    def test_error_and_held_back_rows_carry_identity(self):
+        def boom(*a, **k):
+            raise cooloff.ResolveError("x: HTTP 404")
+        cooloff.resolve_action = boom
+        r = cooloff.resolve_spec("action:veracode/veracode-security-scan@v1", 24, False, False, 10)
+        self.assertEqual((r["status"], r["ecosystem"], r["name"], r["current"]),
+                         ("error", "action", "veracode/veracode-security-scan", "v1"))
+
+        def held(*a, **k):
+            raise cooloff.ResolveError("new: none old enough", held_back=[{"version": "1.0.0"}])
+        cooloff.resolve_pkg = held
+        r = cooloff.resolve_spec("npm:brand-new@0.9.0", 24, False, False, 10)
+        self.assertEqual((r["status"], r["ecosystem"], r["name"], r["current"], r["target"]),
+                         ("held_back", "npm", "brand-new", "0.9.0", None))
+
+        r = cooloff.resolve_spec("../transitive.txt", 24, False, False, 10)
+        self.assertEqual((r["status"], r["name"]), ("error", "../transitive.txt"))
+
+
+class TestBatchInput(unittest.TestCase):
+    def test_a_spec_file_argument_is_read_not_treated_as_a_spec(self):
+        # 29 past runs ran `batch ../tr.txt` and got one `bad spec` row back.
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("npm:vitest@5.0.4\n# comment\n\nnpm:obug@3.0.0\n")
+        try:
+            specs, read = cooloff._read_specs([fh.name, "pypi:ruff@0.17.0"])
+        finally:
+            os.unlink(fh.name)
+        self.assertTrue(read)
+        self.assertEqual([s for s in specs if s and not s.startswith("#")],
+                         ["npm:vitest@5.0.4", "npm:obug@3.0.0", "pypi:ruff@0.17.0"])
+
+
+class TestHeldBackReporting(unittest.TestCase):
+    """closeclaw#30 and vue-demo#112 both said "held back: none" while
+    lucide-react 1.57.0, pinia 4.1.0 and eslint-plugin-oxlint 1.88.0 sat
+    inside the window -- on `update` and `current` rows, not `held_back` ones."""
+
+    def test_select_reports_hours_short(self):
+        from datetime import datetime, timedelta, timezone
+        t = datetime.now(timezone.utc)
+        chosen, skipped, _ = cooloff.select(
+            [("1.56.0", t - timedelta(hours=30)), ("1.57.0", t - timedelta(hours=5.5))],
+            24, False)
+        self.assertEqual(chosen["version"], "1.56.0")
+        self.assertEqual(skipped[0]["version"], "1.57.0")
+        self.assertAlmostEqual(skipped[0]["hours_short"], 18.5, places=1)
+
+    def test_current_row_with_a_waiting_release_needs_attention(self):
+        quiet = {"status": "current", "spec": "npm:vue@3.5.44", "skipped_too_new": []}
+        waiting = {"status": "current", "spec": "npm:pinia@4.0.3",
+                   "skipped_too_new": [{"version": "4.1.0", "hours_short": 21.6}]}
+        self.assertFalse(cooloff._needs_attention(quiet))
+        self.assertTrue(cooloff._needs_attention(waiting))
+        line = cooloff._text_line(waiting, 16)
+        self.assertIn("up to date; held back: 4.1.0 (21.6h short)", line)
+
+    def test_out_writes_every_row_and_prints_only_the_work_list(self):
+        import argparse
+        import contextlib
+        import io
+        import json
+        import tempfile
+        rows = {
+            "npm:vue@3.5.43": {"kind": "pkg", "ecosystem": "npm", "name": "vue",
+                               "current": "3.5.43", "target": "3.5.44", "age_hours": 28.0,
+                               "changed": True, "skipped_too_new": []},
+            "npm:react@19.3.0": {"kind": "pkg", "ecosystem": "npm", "name": "react",
+                                 "current": "19.3.0", "target": "19.3.0", "age_hours": 900.0,
+                                 "changed": False, "skipped_too_new": []},
+        }
+        saved = cooloff.resolve_pkg, cooloff.npm_peer_deps
+        cooloff.resolve_pkg = lambda eco, name, cur, *a, **k: dict(rows[f"{eco}:{name}@{cur}"])
+        cooloff.npm_peer_deps = lambda name, version: {}  # no registry calls from a unit test
+        out = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+        args = argparse.Namespace(specs=list(rows), out=out, json=False, hours=24,
+                                  allow_prerelease=False, same_major=False, jobs=2, max_probe=10)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cooloff.cmd_batch(args)
+            saved_rows = json.load(open(out))
+        finally:
+            cooloff.resolve_pkg, cooloff.npm_peer_deps = saved
+            os.unlink(out)
+        self.assertEqual([r["status"] for r in saved_rows], ["update", "current"])
+        text = buf.getvalue()
+        self.assertIn("UPDATE     npm:vue@3.5.43", text)
+        self.assertNotIn("react", text)
+        self.assertIn("1 current, 1 update -- every row in", text)
+
+
+class TestCheckAge(unittest.TestCase):
+    """The transitive check piped `pkg@locked` through `batch`, which reports
+    the newest *cleared* version: pinia 4.1.0, two hours old, came back
+    `ahead` with "1585h old" (4.0.3's age) and passed a check for `held_back`."""
+
+    def setUp(self):
+        from datetime import datetime, timedelta, timezone
+        t = datetime.now(timezone.utc)
+        self.saved = cooloff.FETCHERS["npm"], cooloff.versions_npm
+        fake = lambda name, allow_prerelease=False: [  # noqa: E731
+            ("4.0.3", t - timedelta(hours=1585)), ("4.1.0", t - timedelta(hours=2.4))]
+        cooloff.FETCHERS["npm"] = cooloff.versions_npm = fake
+
+    def tearDown(self):
+        cooloff.FETCHERS["npm"], cooloff.versions_npm = self.saved
+
+    def test_exact_version_too_new_is_flagged(self):
+        r = cooloff.check_age("npm:pinia@4.1.0", 24)
+        self.assertEqual(r["status"], "too_new")
+        self.assertAlmostEqual(r["hours_short"], 21.6, places=1)
+        self.assertEqual(cooloff.check_age("npm:pinia@4.0.3", 24)["status"], "ok")
+
+    def test_unlisted_version_is_unknown_not_ok(self):
+        self.assertEqual(cooloff.check_age("npm:pinia@9.9.9", 24)["status"], "unknown")
+        self.assertEqual(cooloff.check_age("npm:pinia", 24)["status"], "error")
+
+    def test_ahead_row_does_not_carry_the_declined_versions_age(self):
+        r = cooloff.resolve_spec("npm:pinia@4.1.0", 24, False, False, 10)
+        self.assertEqual((r["status"], r["target"], r["age_hours"]), ("ahead", "4.1.0", None))
+        self.assertEqual(r["downgrade_declined"]["to"], "4.0.3")
+
+
+class TestMavenVersions(unittest.TestCase):
+    """payment, 2026-10-14: search.maven.org's index stopped at
+    spotless-maven-plugin 2.44.5 while 3.10.4 was live, so the 3.10.3 pin read
+    as `ahead` -- unless the search happened to time out that run."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        self.old = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        self.saved = (cooloff._maven_index_dates, cooloff._maven_metadata_versions,
+                      cooloff._maven_pom_date)
+        self.probed = []
+
+        def pom_date(g, a, v):
+            self.probed.append(v)
+            return self.old
+        cooloff._maven_pom_date = pom_date
+
+    def tearDown(self):
+        (cooloff._maven_index_dates, cooloff._maven_metadata_versions,
+         cooloff._maven_pom_date) = self.saved
+
+    def test_metadata_decides_what_exists_and_stale_index_only_dates(self):
+        cooloff._maven_index_dates = lambda g, a: {"2.44.4": self.old, "2.44.5": self.old}
+        cooloff._maven_metadata_versions = lambda g, a: ["2.44.4", "2.44.5", "3.10.3", "3.10.4"]
+        got = dict(cooloff.versions_maven("com.diffplug.spotless:spotless-maven-plugin"))
+        self.assertEqual(set(got), {"2.44.4", "2.44.5", "3.10.3", "3.10.4"})
+        self.assertEqual(sorted(self.probed), ["3.10.3", "3.10.4"])  # only what the index lacked
+
+    def test_index_down_still_dates_older_major_lines(self):
+        # --same-major on 2.x with the index down found nothing dated at all.
+        cooloff._maven_index_dates = lambda g, a: {}
+        three = [f"3.{i}.0" for i in range(20)]
+        cooloff._maven_metadata_versions = lambda g, a: ["2.45.0", "2.46.0", "2.46.1"] + three
+        got = dict(cooloff.versions_maven("g:a", probe=15))
+        self.assertIn("2.46.1", got)
+        self.assertEqual(len([v for v in got if v.startswith("3.")]), 15)
+
+
+class TestTransientRetry(unittest.TestCase):
+    def setUp(self):
+        self.saved = (cooloff.urllib.request.urlopen, cooloff.time.sleep)
+        cooloff.time.sleep = lambda s: None
+
+    def tearDown(self):
+        cooloff.urllib.request.urlopen, cooloff.time.sleep = self.saved
+
+    def test_truncated_body_is_retried_once(self):
+        # nextjs: eslint-config-next's 7 MB packument arrived truncated.
+        import http.client
+        calls = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise http.client.IncompleteRead(b"{", 10)
+                return b'{"ok": true}'
+
+        cooloff.urllib.request.urlopen = lambda req, timeout=30: Resp()
+        self.assertEqual(cooloff._read(object()), b'{"ok": true}')
+        self.assertEqual(len(calls), 2)
+
+    def test_a_404_is_an_answer_not_retried(self):
+        calls = []
+
+        def nope(req, timeout=30):
+            calls.append(1)
+            raise cooloff.urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+
+        cooloff.urllib.request.urlopen = nope
+        with self.assertRaises(cooloff.urllib.error.HTTPError):
+            cooloff._read(object())
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
