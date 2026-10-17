@@ -151,6 +151,12 @@ What it does:
   It crosses a major only when no backport exists, and then only to the
   floor's major. A CVE patch published minutes ago gets held back and surfaced
   as a tradeoff, not adopted silently.
+- Never treats "newer than the vulnerable range" as a fix when the advisory
+  names no patched version. Such advisories list every release up to the
+  newest, so the next release is outside the range whether or not it fixes
+  anything (astro#20/#21). It opens a PR there only on a cited upstream fix;
+  otherwise the alert is `no fix available`, reported with the parent chain
+  that pulls the package in.
 - Fixes transitive alerts in place: a targeted lockfile update when the
   parent's range allows it, else a same-major parent bump, else an
   `overrides`/`resolutions` stopgap. It never adds a transitive package as a
@@ -221,8 +227,9 @@ upstream rather than being pushed independently.
 The version resolver the agent relies on. Usable standalone and in CI:
 
 ```bash
-# whole repo in one pass: every manifest + every workflow `uses:`
-scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json
+# whole repo in one pass: every manifest + every workflow `uses:`. Saves every
+# row to batch.json and prints only the rows that need attention.
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --out batch.json
 
 # just the inventory, one `ecosystem:name@current` spec per line
 scripts/cooloff.py scan-deps --dir .
@@ -232,19 +239,32 @@ scripts/cooloff.py pkg -e npm -n react -c 18.2.0 --json
 scripts/cooloff.py pkg -e pypi -n requests
 scripts/cooloff.py action actions/checkout@v4 --json
 
+# is each exact version (say, every entry a lockfile regen added) past the window?
+scripts/cooloff.py check-age transitive.txt        # exit 5 if any is too new
+
 # audit pin state of every `uses:` in .github/workflows (exit 2 if unpinned)
 scripts/cooloff.py scan-actions --dir .
 
 # apply saved batch results to every workflow `uses:` in one pass
-scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > batch.json
-scripts/cooloff.py pin-actions batch.json --dir . [--dry-run]
+scripts/cooloff.py pin-actions batch.json --dir . --skip-majors [--dry-run]
 ```
 
 `pin-actions` never resolves anything itself: it rewrites each external
 `uses:` to `owner/repo[/path]@<sha> # <tag>` from rows `batch` already
 resolved, lists any unpinned ref it had no row for (held back or errored), and
 exits 4 without writing if an existing pin's SHA no longer matches its tag
-comment — a moved tag is a compromise signal, not an update.
+comment — a moved tag is a compromise signal, not an update. `--skip-majors`
+leaves rewrites that would cross a major version alone and lists them, so a
+routine sweep can always run it.
+
+`check-age` answers a different question from `batch`. `batch` asks "what is
+the newest version that has cleared the window?". `check-age` asks "has *this*
+version cleared it?". That second question is the one a regenerated lockfile
+poses. Run through `batch`, a locked version still inside the window comes
+back `ahead` or `update`, never `held_back`. `check-age` labels each spec
+`ok`, `too_new` (with `hours_short`), or `unknown` (not a listed release:
+yanked, deprecated or unpublished). It exits 5 if any is too new and 3 if any
+is unknown.
 
 `scan-deps` reads `package.json`, `requirements*.txt`, `pyproject.toml`
 (PEP 621 and Poetry), `Cargo.toml`, `go.mod`, `Gemfile`, `*.csproj`/`*.fsproj`,
@@ -254,10 +274,25 @@ version, or a TOML manifest on Python 3.10 without `tomllib` — is reported as 
 `note:` on stderr rather than silently dropped.
 
 `batch` resolves specs concurrently (`-j`, default 8) behind a shared response
-cache, and labels each row `update`, `current`, `resolved` (nothing pinned to
-compare against), `held_back` (newer version still inside the window), or
-`error`. It exits 3 if any row errored — the other rows still resolved. Empty stdin
-(`scan-deps` on a repo with no manifests) prints `[]` and exits 0.
+cache. Specs come as arguments, `-` for stdin, or a path to a file of specs. It
+labels each row `update`, `current`, `resolved` (nothing pinned to compare
+against), `held_back` (nothing newer has cleared the window at all),
+`peer_held`, `above_ceiling`, `ahead`, or `error`. Every row, actions and
+errors included, carries `kind`, `ecosystem`, `name`, `current` and `target`.
+A newer release still inside the window usually rides on an `update` or
+`current` row as `skipped_too_new`, each entry with `hours_short`. The text
+table shows these as `; held back: <version> (<N>h short)`. `--out FILE`
+writes the JSON to FILE and prints only the rows that need attention. Retries
+cover dropped or truncated registry responses and transient `gh` failures,
+not 4xx answers. It exits 3 if any row errored — the other rows still
+resolved. Empty input (`scan-deps` on a repo with no manifests) prints
+`nothing to resolve` (`[]` with `--json`) and exits 0.
+
+Maven versions come from the artifact's `maven-metadata.xml`, which is what
+Maven itself resolves against. search.maven.org only supplies dates. Its index
+lags by months: in October 2026 it topped out at spotless-maven-plugin 2.44.5
+while 3.10.4 was live. Versions it is missing are dated from their POM's
+`Last-Modified`.
 
 Ecosystems: `npm`, `pypi`, `crates`, `rubygems`, `go`, `maven`, `nuget`, plus
 `action:` specs in batch input.
@@ -275,10 +310,13 @@ Requires Python 3.10+ and, for the `action` subcommand, an authenticated `gh`.
 
 ### scripts/verify_alerts.py
 
-The dependabot-fixer's post-push check. It reads the npm or pnpm lockfile for
-each alert's manifest **from GitHub at a given ref**, not from a local
-checkout, so neither an unpushed working tree nor a sibling agent's clone can
-make a fix look done:
+The dependabot-fixer's post-push check. It reads the lockfile for each alert's
+manifest **from GitHub at a given ref**, not from a local checkout, so neither
+an unpushed working tree nor a sibling agent's clone can make a fix look done.
+npm alerts are read from `package-lock.json`/`pnpm-lock.yaml`. pip alerts are
+read from the pinned `requirements*.txt` itself, or `poetry.lock`, `uv.lock`
+or `Pipfile.lock` beside the manifest. A lockfile is only ever read for its
+own ecosystem's alerts:
 
 ```bash
 # every open alert against a PR branch
@@ -290,10 +328,12 @@ scripts/verify_alerts.py robertncl/node1 dependabot-fix/npm-transitive-root --al
 
 Each alert is `fixed` (no installed copy, nested ones included, is inside the
 advisory's `vulnerable_version_range`), `vulnerable` (lists the offending
-versions), `inconsistent` (an npm entry's `version` disagrees with the tarball
-its `resolved` URL points at -- a hand-edited lockfile that still installs the
-old code), or `unsupported` (no npm/pnpm lockfile beside the manifest; check by
-hand). It compares against the range rather than `first_patched_version`, so a
-fix backported to an older line (picomatch 2.3.2 against a 4.0.4 floor) counts
-as fixed. Reads npm lockfile v1–v3 and pnpm v5, v6, and v9. Needs an
-authenticated `gh`.
+versions), `unconfirmed` (outside the range, but the advisory names no patched
+version, so the newer release is not evidence of a fix), `inconsistent` (an
+npm entry's `version` disagrees with the tarball its `resolved` URL points at
+-- a hand-edited lockfile that still installs the old code), or `unsupported`
+(no lockfile it reads for that ecosystem; check by hand). It compares against
+the range rather than `first_patched_version`, so a fix backported to an older
+line (picomatch 2.3.2 against a 4.0.4 floor) counts as fixed. Reads npm
+lockfile v1–v3, pnpm v5, v6, and v9, pip requirements pins, poetry.lock,
+uv.lock, and Pipfile.lock. Needs an authenticated `gh`.

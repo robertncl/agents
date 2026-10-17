@@ -99,5 +99,86 @@ class TestTarballMismatch(unittest.TestCase):
         self.assertEqual(va.npm_mismatches(__import__("json").dumps(lock)), {})
 
 
+class TestPipLocks(unittest.TestCase):
+    """crypto-bot: every pip alert came back `unsupported`, so each fixer run
+    re-read the pushed requirements files by hand."""
+
+    def test_pip_compile_output(self):
+        text = ("#\n#    pip-compile --generate-hashes requirements.in\n#\n"
+                "multidict==6.9.1 \\\n"
+                "    --hash=sha256:065665c041c42a5938ed220bdcd7230f22527fbec085e1853d2402c8a3615d9d \\\n"
+                "    # via\n    #   aiohttp\n    #   ccxt\n"
+                "PyYAML==6.0.3 \\\n    --hash=sha256:abc\n"
+                "uvicorn[standard]==0.30.1 ; python_version >= \"3.9\"\n"
+                "-r base.txt\n")
+        got = va.requirements_versions(text)
+        self.assertEqual(got, {"multidict": {"6.9.1"}, "pyyaml": {"6.0.3"},
+                               "uvicorn": {"0.30.1"}})
+
+    def test_poetry_uv_and_pipfile_locks(self):
+        toml = ('[[package]]\nname = "Charset_Normalizer"\nversion = "3.4.2"\n'
+                'description = "x"\n\n[[package]]\nname = "idna"\nversion = "3.10"\n')
+        self.assertEqual(va.toml_lock_versions(toml),
+                         {"charset-normalizer": {"3.4.2"}, "idna": {"3.10"}})
+        pipfile = '{"default": {"urllib3": {"version": "==2.8.0"}}, "develop": {"pytest": {"version": "==9.1.1"}}}'
+        self.assertEqual(va.pipfile_lock_versions(pipfile),
+                         {"urllib3": {"2.8.0"}, "pytest": {"9.1.1"}})
+
+    def test_pep440_prerelease_sorts_before_release(self):
+        self.assertLess(va.parse_version("2.0.0rc1"), va.parse_version("2.0.0"))
+        self.assertTrue(va.in_range("2.0.0rc1", "< 2.0.0"))
+        self.assertFalse(va.in_range("6.9.1", ">= 6.7.0, <= 6.9.0"))
+
+
+class TestCheck(unittest.TestCase):
+    def alert(self, n, eco, pkg, manifest, rng, patched):
+        return {"number": n,
+                "dependency": {"package": {"name": pkg, "ecosystem": eco}, "manifest_path": manifest},
+                "security_vulnerability": {
+                    "vulnerable_version_range": rng,
+                    "first_patched_version": {"identifier": patched} if patched else None}}
+
+    def run_check(self, alerts, files, only=None):
+        saved = va.open_alerts, va.gh_raw
+        va.open_alerts = lambda repo: alerts
+        va.gh_raw = lambda repo, path, ref: files.get(path)
+        try:
+            return {r["alert"]: r for r in va.check("o/r", "fix", only)}
+        finally:
+            va.open_alerts, va.gh_raw = saved
+
+    def test_outside_an_unpatched_range_is_unconfirmed_not_fixed(self):
+        # astro#21: http-cache-semantics 4.3.0 is above `<= 4.2.0` and does
+        # not contain a fix; the advisory names no patched version.
+        lock = __import__("json").dumps({"lockfileVersion": 3, "packages": {
+            "node_modules/http-cache-semantics": {"version": "4.3.0"}}})
+        rows = self.run_check(
+            [self.alert(74, "npm", "http-cache-semantics", "package-lock.json", "<= 4.2.0", None)],
+            {"package-lock.json": lock})
+        self.assertEqual(rows[74]["status"], "unconfirmed")
+
+    def test_removed_package_is_fixed_even_without_a_patch(self):
+        lock = __import__("json").dumps({"lockfileVersion": 3, "packages": {}})
+        rows = self.run_check(
+            [self.alert(6, "npm", "sprintf-js", "package-lock.json", "<= 1.1.3", None)],
+            {"package-lock.json": lock})
+        self.assertEqual(rows[6]["status"], "fixed")
+
+    def test_each_ecosystem_reads_only_its_own_lockfile(self):
+        # A pip or cargo package is absent from package-lock.json, and absent
+        # used to read as "fixed".
+        npm_lock = __import__("json").dumps({"lockfileVersion": 3, "packages": {}})
+        rows = self.run_check(
+            [self.alert(12, "pip", "multidict", "requirements.txt", ">= 6.7.0, <= 6.9.0", "6.9.1"),
+             self.alert(11, "pip", "multidict", "requirements-dev.txt", ">= 6.7.0, <= 6.9.0", "6.9.1"),
+             self.alert(3, "rust", "time", "Cargo.lock", "< 0.2.23", "0.2.23")],
+            {"package-lock.json": npm_lock,
+             "requirements.txt": "multidict==6.9.1 \\\n    --hash=sha256:x\n",
+             "requirements-dev.txt": "multidict==6.7.1 \\\n    --hash=sha256:y\n"})
+        self.assertEqual(rows[12]["status"], "fixed")
+        self.assertEqual(rows[11]["status"], "vulnerable")
+        self.assertEqual(rows[3]["status"], "unsupported")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -92,8 +92,13 @@ transitive packages most alerts fire on), so build specs from the alerts:
 
 ```bash
 printf 'npm:lodash@4.17.20\npypi:requests@2.28.0\naction:actions/checkout@v4\n' \
-  | scripts/cooloff.py batch - --json
+  | scripts/cooloff.py batch - --out "<work>/fix.json"
 ```
+
+`--out` saves the rows as JSON and prints the ones that need attention, so read
+that table instead of re-parsing the file. Every row carries `ecosystem`,
+`name`, `current` and `target`. `batch` also reads a file of specs given as
+an argument.
 
 Current version comes from the manifest or lockfile — the alert payload does not
 carry it. If you genuinely cannot determine it, omit `@current`; the row returns
@@ -112,8 +117,12 @@ carry it. If you genuinely cannot determine it, omit `@current`; the row returns
 advisory and say in the report that they skipped the cooloff check.
 
 Row statuses: `update` (cleared the window — your work list), `current`,
-`resolved`, `held_back` (**not an error** — carry into the report), `peer_held` / `above_ceiling` / `ahead` (keep the current pin — see
-dependency-updater.md for what each means), `error`.
+`resolved`, `held_back` (nothing newer has cleared at all — **not an error**,
+carry into the report), `peer_held` / `above_ceiling` / `ahead` (keep the
+current pin — see dependency-updater.md for what each means), `error`. A newer
+release still inside the window usually rides on an `update` or `current` row
+in `skipped_too_new` (with `hours_short`), shown in the table as `; held back:`.
+That is where a fresh patch you must not adopt yet shows up.
 `batch` exits 3 if any row errored while every other row resolved, so read the
 output rather than reacting to the exit code. `pkg` / `action` remain for spot
 checks and anything batch could not resolve.
@@ -122,13 +131,16 @@ checks and anything batch could not resolve.
 Step 4 feeds the floor in as the `@current` of the spec so `--same-major` keeps
 the answer on the floor's major line.
 
-`scripts/verify_alerts.py <owner/repo> <ref> [--alerts N,M]` reads the npm or
-pnpm lockfile **from GitHub at that ref** and reports each open alert as
-`fixed`, `vulnerable` (with the installed versions still inside the range),
+`scripts/verify_alerts.py <owner/repo> <ref> [--alerts N,M]` reads the lockfile
+**from GitHub at that ref**: npm/pnpm for npm alerts, and for pip alerts the
+pinned `requirements*.txt` itself (or poetry.lock / uv.lock / Pipfile.lock
+beside the manifest). It reports each open alert as `fixed`, `vulnerable` (with
+the installed versions still inside the range), `unconfirmed` (outside the
+range, but the advisory names no patched version — not a fix, see step 4),
 `inconsistent` (npm `version` bumped but `resolved` still on the old tarball —
 a hand-edited lockfile; redo it with the package manager), or `unsupported`
-(other ecosystems — check by hand). Exit 0 only when every
-checked alert is fixed. Step 7 requires it after every push.
+(other ecosystems — check by hand). Exit 0 only when every checked alert is
+fixed. Step 7 requires it after every push.
 
 ## Working directory — one per repo, never shared
 
@@ -140,18 +152,28 @@ concluded astro "is not a dependency". Every file you write goes under a
 directory unique to this repo *and* this run:
 
 ```bash
-work=$(mktemp -d "${SCRATCH:-${TMPDIR:-/tmp}}/dependabot-<repo>-XXXXXX")
-git clone "https://github.com/<owner>/<repo>.git" "$work/src"
+work=$(mktemp -d "<scratchpad>/dependabot-<repo>-XXXXXX") && echo "$work"
+git clone "https://github.com/<owner>/<repo>.git" "${work:?}/src"
 ```
 
-Keep alert dumps, cooloff output, PR bodies, and reports inside `$work` too.
-Never reuse a directory you did not create in this run, and never `cd` into a
-bare relative path like `repo/`.
+**Shell variables do not survive between Bash calls.** After this call, write
+the literal path that `echo` printed (`<work>` below) in every later command.
+`$work` in a new call is empty, and `${work:?}` makes that fail loudly instead
+of acting on the current directory. A 2026-09-25 run did `cd "$work"` in a
+fresh call, landed in this repo, and cloned
+skills-secure-repository-supply-chain into `agents/src/`. `$SCRATCH` is not
+set in your environment either: name the scratchpad path from your system
+prompt.
+
+Keep alert dumps, cooloff output, PR bodies, and reports inside `<work>` too.
+astro#21's body went to `<scratchpad>/body.md`, the one name five parallel
+fixers would all have written. Never reuse a directory you did not create in
+this run, and never `cd` into a bare relative path like `repo/`.
 
 **Before every commit and every push**, confirm you are where you think:
 
 ```bash
-git -C "$work/src" remote get-url origin   # must name <owner>/<repo>
+git -C "<work>/src" remote get-url origin   # must name <owner>/<repo>
 ```
 
 Mismatch → stop, discard that analysis, re-clone. Do not "fix" the remote.
@@ -182,8 +204,15 @@ gh pr list --repo <owner>/<repo> --state open --json number,title,headRefName,au
 ```
 
 - **Dependabot itself** has an open PR for that package → skip, say so.
-- A branch matching your naming scheme already exists on the remote → skip.
-  This is what makes re-running you idempotent instead of PR spam.
+- An **open** PR from a `dependabot-fix/` branch already covers that package
+  (named in its title, or its alerts listed in its body) → skip and report it as
+  `addressed by PR #N (found already open)`. This is what makes re-running you
+  idempotent instead of PR spam.
+- A `dependabot-fix/` branch with **no open PR** is a leftover from a merged or
+  closed PR, and it covers nothing. Fix the alert anyway, on a fresh branch
+  (step 7). hrms keeps `dependabot-fix/npm-transitive-root` from merged #102,
+  and astro keeps it from closed #20 and #21. Treating a bare branch as
+  "handled" would skip every later transitive alert in those repos forever.
 
 **4. Resolve every fix version, once, up front.** One spec per surviving work
 item, one `batch` call, before you touch a branch. Doing this up front also
@@ -197,7 +226,7 @@ item's alerts) and always pass `--same-major`:
 
 ```bash
 printf 'npm:vite@6.4.3\nnpm:minimist@1.2.6\n' \
-  | scripts/cooloff.py batch - --same-major --json
+  | scripts/cooloff.py batch - --same-major --out "<work>/fix.json"
 ```
 
 Dependabot reports the floor for the release line you are actually on, so when
@@ -215,7 +244,7 @@ Then read each row:
 | `status` `update` or `current` | `target` is your fix version (`current` means the floor itself is the newest cooled-off release on its line). |
 | `target` < floor, `ahead`, or `held_back` with the patched version in `skipped_too_new` | The patch has not cleared the window. **Do not bypass on your own initiative.** Report the tradeoff — CVE severity and exploit status versus an unvetted publish — with age in hours from `skipped_too_new`. Lower `--hours` only when the user asks. |
 | `status: error` | Resolve by hand with `pkg`/`action`, report what failed. An errored row is an **unfixed vulnerability**, not a row you may skip silently. |
-| `first_patched_version` is null | No PR. Report the alert, the advisory, and any documented workaround or maintained replacement. **Never invent a version number.** |
+| `first_patched_version` is null | No PR. Report `no fix available` with the alert, the advisory, the parent that pulls the package in, and any documented workaround or maintained replacement (step 8). **Never invent a version number**, and **a release above the vulnerable range is not a fix.** An advisory with no patched version lists every release that existed when it was published (`<= 4.2.0`), so a later release falls outside the range whether or not it fixes anything. astro#20 and #21 both shipped http-cache-semantics 4.3.0 for GHSA-ch52-4w7c-c8xp, and 4.3.0 only changed Vary handling. The max-stale bug was still there, with the upstream fix PRs unmerged. Open a PR only if the advisory's references or the upstream changelog or commit name the release that fixes it, and cite that link in the PR body. `verify_alerts.py` reports these as `unconfirmed`, never `fixed`. This holds even when the caller's prompt asks you to "check for a release outside the vulnerable range". |
 | Floor is on a higher major than the installed version | The only case where you cross a major, and only to the floor's major. Check the changelog, flag it loudly in the report and PR body, and never bundle it with other fixes. |
 
 **5. Reach transitive vulnerabilities correctly.** Most alerts fire on a package
@@ -279,18 +308,21 @@ Put the before/after output in the PR body.
 
 Always commit the regenerated lockfile (`package-lock.json`, `pnpm-lock.yaml`,
 `poetry.lock`, `uv.lock`, `Cargo.lock`, `Gemfile.lock`, `go.sum`) — that is what
-pins the transitive tree. Then diff it, turn **added or bumped** entries into
-specs, and check them in one `batch` call — a security bump dragging in a
-brand-new sub-dependency has reopened the door you just closed:
+pins the transitive tree. Then turn its **added or bumped** entries into
+`ecosystem:name@version` lines and check those exact versions in one
+`check-age` call. A security bump dragging in a brand-new sub-dependency has
+reopened the door you just closed:
 
 ```bash
-git diff "origin/$def" -- package-lock.json \
-  | <extract added/bumped name@version> \
-  | scripts/cooloff.py batch - --json
+# one spec per added/bumped lockfile entry (dependency-updater.md step 4 has a script)
+scripts/cooloff.py check-age "<work>/transitive.txt"
 ```
 
-Anything `held_back` here arrived as a side effect of your fix — say so in the
-PR body.
+Not `batch`: it reports the newest version that has cleared, so a locked
+version still inside the window comes back `ahead` or `update`, never
+`held_back`. `TOO_NEW` (exit 5) arrived as a side effect of your fix. Say so
+in the PR body and treat the fix as held. `UNKNOWN` means the locked version
+is not a listed release: stop and report it.
 
 **6. Vulnerable GitHub Actions** (`ecosystem: "actions"`): resolve in the same
 batch as `action:owner/repo@current` specs; the row carries `tag` and `sha`.
@@ -309,10 +341,14 @@ as the "fix"; a mutable tag *is* the vulnerability.
   `dependabot-fix/<eco>-<package>-<new-version>`.
 - **Transitive fixes** (lockfile-only updates and overrides, no direct version
   changes): **one** combined branch and PR per manifest —
-  `dependabot-fix/<eco>-transitive-<manifest-dir-or-root>`. They all rewrite
-  the same lockfile, so ten separate PRs means nine merge conflicts after the
-  first merge. The PR body lists every package, its alerts, and before → after
-  in a table.
+  `dependabot-fix/<eco>-transitive-<manifest-dir-or-root>-<YYYYMMDD>`. They all
+  rewrite the same lockfile, so ten separate PRs means nine merge conflicts
+  after the first merge. The PR body lists every package, its alerts, and
+  before → after in a table.
+- **The name must be new on the remote.** If `git ls-remote --heads origin
+  <name>` returns anything, add `-<HHMM>`. Never push onto, or force-push
+  over, a branch this run did not create. Merged and closed PRs leave their
+  branches behind (see step 3).
 
 For each branch, in order:
 
@@ -407,6 +443,17 @@ Report exactly, not optimistically:
   that row has `scope: development`. Otherwise say nothing about impact.
 - Say `major bump` on every row whose major changes — all of them, not just
   the ones you noticed.
+- Every `no fix available` row names the chain that pulls the package in and
+  quotes the advisory's own workaround, if it has one. Every 2026-10-13
+  no-fix report said "I did not trace the parent", so the user could not tell
+  a runtime exposure from test tooling. pokedev's "high, runtime" braces
+  arrives only through `jest → @jest/core → micromatch`. Both checks are
+  one call each, with no install:
+
+  ```bash
+  cd "<work>/src/<manifest dir>" && npm ls <pkg> --all --package-lock-only   # pip: the `# via` lines
+  gh api /advisories/<ghsa> --jq '.description'
+  ```
 
 ## Judgment
 
@@ -441,3 +488,11 @@ Each of these cost repeated failed calls in past runs.
 - Never `git stash` in a target checkout — a dirty tree is a gate failure.
 - Do not read or patch `scripts/cooloff.py` mid-run. Output that looks wrong is
   reported with the row verbatim; fixing the tool is a separate change.
+- Toolchains on this machine: `go` is not on `PATH`, so prefix
+  `PATH="$HOME/sdk/go/bin:$PATH"`. There is no `python3-venv` and no `uv`
+  (crypto-bot#30 lost two calls to both): build venvs with `python3 -m venv
+  --without-pip <work>/venv` and install with `python3 -m pip --python
+  <work>/venv/bin/python install --require-hashes -r requirements-dev.txt`.
+- Your report is your last call, made alone, after every other result is back.
+  A report sent in the same turn as another command was delivered as the word
+  `placeholder`.

@@ -64,7 +64,11 @@ Single PR given? Run the same check for just that one. Nothing to review →
 report that in one line and stop.
 
 **3. Fetch and read the actual diff**, not just filenames. Save every diff to a
-file in your scratchpad in one call, then read from the files:
+file in a directory of your own, in one call, then read from the files.
+`<scratch>` below is `mktemp -d "<scratchpad>/review-XXXXXX"`, created once,
+with its literal path reused in every later call. Reviewers run in parallel,
+so never write helper scripts or checkouts (`lk.py`, `nx/`) into the bare
+scratchpad:
 
 ```bash
 gh pr diff <n> -R <o>/<r> > "<scratch>/<repo>-<n>.diff"
@@ -88,6 +92,20 @@ read of the lockfile:
   `gh api repos/<owner>/<action>/commits/<tag> --jq .sha` (one loop for all).
 - New `install`/`postinstall` scripts or new packages in the lockfile: call out.
 - Go: `go.mod` changed ⇒ `go.sum` changed too.
+- **The 24h cooloff, checked independently.** Put every added or bumped
+  `name@version` (manifest and lockfile, `action:owner/repo@tag` for workflow
+  pins) in one file and run `/home/robert/code/agents/scripts/cooloff.py
+  check-age <file>`. Any `TOO_NEW` (exit 5) means a version younger than the
+  window got in. That is a supply-chain finding, `REQUEST_CHANGES` on its
+  merits, whatever the PR body claims.
+- **A security fix must contain the fix.** For a `fix(deps)` PR, read each
+  claimed advisory with `gh api /advisories/<ghsa> --jq
+  '.vulnerabilities[]|{package,first_patched_version,vulnerable_version_range}'`.
+  The new version must be at or above `first_patched_version`. If that is
+  null, being above the vulnerable range proves nothing. The PR must cite the
+  upstream commit or release that fixes it, or it is a correctness finding:
+  the alert would close on merge with the bug still shipped. astro#21 was
+  exactly this, and it was caught only because the caller asked.
 
 **4. Security findings.** Flag only what the diff actually introduces:
 

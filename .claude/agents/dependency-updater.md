@@ -51,8 +51,18 @@ process launch and a serial round trip per dependency dominates the runtime.
 
 ```bash
 # whole repo -- every manifest plus every workflow `uses:` -- one command
-scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --out "$SCRATCH/batch.json"
 ```
+
+`--out` saves every row as JSON for the later steps and prints only the rows
+that need attention: every `update` (`action:` rows included), every row with
+a release still inside the window, every `peer_held`/`ahead`/`error` row, and
+then a status count. **That printout is the work list. Read it. Don't re-parse
+the JSON with a one-liner of your own.** Ad-hoc parsers hit KeyError on action
+rows in 20 past runs. vue-demo's then filtered the actions out, and its PR said
+"No actions to pin" while angular and dinoquest got the same scorecard-action
+bump. Every row now carries `ecosystem`, `name`, `current` and `target`
+(`ecosystem: "action"` for workflow refs).
 
 `scan-deps` covers `package.json`, `requirements*.txt`, `pyproject.toml`,
 `go.mod`, `Cargo.toml`, `Gemfile`, `pom.xml`, `*.csproj`, and every `uses:`
@@ -71,11 +81,20 @@ Each `batch` row carries a `status`:
 | `update` | Newer version cleared the window | **Your work list.** Apply it (subject to the SDK rule in step 5). |
 | `current` | Already on target | Nothing. |
 | `resolved` | No pinned version to compare | Decide whether to pin; report. |
-| `held_back` | Newer version inside the window | **Not an error.** Keep current, report hours short. |
+| `held_back` | *Nothing* newer has cleared the window yet | **Not an error.** Keep current, report hours short. |
 | `peer_held` | The bump violates a peerDependency range another package in the sweep declares | **Not an error.** `npm ci` would fail on it. Keep current, report the requirer and range from `peer_conflicts`. |
 | `above_ceiling` | The pin is newer than a `VERSION_CEILING` allows | **Never downgrade.** Keep the pin, report the ceiling's `reason`. |
 | `ahead` | The pin is newer than anything selectable, with no ceiling in play | Keep the pin. Usually a placeholder release (react-native's `1000.0.0`). |
 | `error` | 404 / bad spec / network | Retry with `pkg` or `action`, then report by hand. |
+
+**"Held back by cooloff" is mostly not a status.** A newer release still
+inside the window usually sits on an `update` or `current` row, in
+`skipped_too_new`, and each entry carries `hours_short`. The update then goes
+to the newest version that *has* cleared. The table prints these as `; held
+back: 1.57.0 (18.4h short)`. They are your held-back report. Sweeps that
+looked only for `status: held_back` told closeclaw#30 and vue-demo#112 "held
+back: none" while lucide-react 1.57.0, pinia 4.1.0 and eslint-plugin-oxlint
+1.88.0 were waiting.
 
 A row's `ceiling` field is set only when a ceiling actually constrained that
 row. `ceiling: null` means no ceiling applied. Never report a package as
@@ -137,11 +156,11 @@ git checkout -B "chore/deps-$(date +%Y%m%d-%H%M)" "origin/$def"
 - Re-derive every target version against the base you just cut from. Cached
   resolution output from an earlier run describes a tree that no longer exists.
 
-**2. Resolve everything, once.** Run the `scan-deps | batch` command and save
-the JSON to a file — every later step reads that file:
+**2. Resolve everything, once.** Run the `scan-deps | batch` command. It saves
+the JSON every later step reads and prints the work list:
 
 ```bash
-scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > "$SCRATCH/batch.json"
+scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --out "$SCRATCH/batch.json"
 ```
 
 - `$SCRATCH` stands for a directory unique to this repo *and* this run — never
@@ -154,12 +173,13 @@ scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > "$SCR
   then write that literal path in each command — shell variables do not
   survive between calls. Keep every other file you write (PR bodies, logs,
   clones) inside it too.
-- Output `[]` means the repo has nothing to resolve: report it current and stop.
+- `nothing to resolve` means the repo has no manifests: report it current and stop.
 - No `update` rows: report current and stop. No install, no PR, and **no
   leftover branch**: switch back to the branch you recorded in step 1 and
   delete the one you created (`git checkout <start> && git branch -D <yours>`).
   Past sweeps left checkouts parked on empty `chore/deps-*` branches. Do the
-  same whenever you end a repo with nothing committed.
+  same whenever you end a repo with nothing committed. (A fresh clone under
+  `$SCRATCH` is thrown away, so it needs no cleanup.)
 - Everything below edits files to match decisions this step already made. Do
   not re-run `scan-deps` to "check", do not re-query per package with `pkg`,
   `npm view`, or a hand-written registry fetch, and do not re-run the sweep
@@ -167,18 +187,26 @@ scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --json > "$SCR
 
 **3. GitHub Actions — pin to SHA.** The `action:` rows already carry `tag` and
 `sha`. Apply them all in one command — never Read and Edit workflow files line
-by line:
+by line. **Run it every time, even if you saw no `action:` row in the table.**
+It is a no-op when every pin is current (`rewrote 0`), and skipping it on a
+misread table is how vue-demo#112 missed its Action bump:
 
 ```bash
-scripts/cooloff.py pin-actions "$SCRATCH/batch.json" --dir .
+scripts/cooloff.py pin-actions "$SCRATCH/batch.json" --dir . --skip-majors
 ```
 
 It rewrites every external `uses:` across `.github/workflows` and
 `.github/actions` to `owner/repo[/path]@<40-char sha> # <tag>`, leaves `./local`
 and `docker://` refs alone, prints each rewrite, and lists on stderr any
-unpinned ref it left alone (held back or errored — report those). Exit 4 means
-a line is pinned to a different SHA than its tag comment now resolves to: it
-wrote nothing. That is a compromise signal — stop and report, do not re-pin.
+unpinned ref it left alone (held back or errored — report those).
+`--skip-majors` leaves any rewrite that would cross a major version untouched
+and lists it (`note: major bump left for its own PR`). Report those under major
+bumps. Exit 4 means a line is pinned to a different SHA than its tag comment now
+resolves to: it wrote nothing. That is a compromise signal — stop and report,
+do not re-pin. An `action:` row that errors with `HTTP 404` means the action's
+repo no longer exists or is private. A floating `@v1` pointing at it fails
+today, and it will run whatever code is published under that name later.
+Report it as a finding, not a resolver hiccup (gh-action-demo has three).
 The result must read:
 
 ```yaml
@@ -253,19 +281,44 @@ integrity hashes.
 
   Any output means the PR would fail `npm ci` in that directory. pokedev#21
   shipped exactly that for `mobile/`.
+- **A whole-file lockfile diff is formatting, not dependencies.** npm rewrites
+  a 4-space `package-lock.json` to the 2-space indent of its `package.json`
+  (pokedev's `mobile/`: 20,086 changed lines for two real bumps). Restore the
+  file's original indent with a pure re-serialization, never a hand edit of
+  any value. Then confirm `git diff --stat` is small and rerun `npm ci`:
+
+  ```bash
+  python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); open(p,"w").write(json.dumps(d, indent=4, ensure_ascii=False)+"\n")' mobile/package-lock.json
+  ```
+
 - Prove it is coherent with a lockfile-respecting install (`npm ci`,
   `uv sync --frozen`) **in each of those directories**.
 - **Transitive dependencies need the cooloff too.** A clean direct upgrade can
-  pull in a brand-new sub-dependency — this is where real attacks land. Diff the
-  regenerated lockfile, collect every added or bumped entry, check them as **one
-  batch**:
+  pull in a brand-new sub-dependency — this is where real attacks land. Collect
+  every added or bumped lockfile entry, then check those **exact** versions in
+  one call:
 
   ```bash
-  printf 'npm:%s\n' pkg@ver ... | scripts/cooloff.py batch -
+  # from the repo root, before committing; list every lockfile you regenerated
+  python3 - package-lock.json mobile/package-lock.json > "$SCRATCH/transitive.txt" <<'PY'
+  import json, subprocess, sys
+  for path in sys.argv[1:]:
+      new = json.load(open(path))["packages"]
+      old = json.loads(subprocess.check_output(["git", "show", f"HEAD:{path}"]))["packages"]
+      for key, meta in new.items():
+          ver = meta.get("version")
+          if "node_modules/" in key and ver and ver != old.get(key, {}).get("version"):
+              print(f"npm:{meta.get('name') or key.rsplit('node_modules/', 1)[1]}@{ver}")
+  PY
+  scripts/cooloff.py check-age "$SCRATCH/transitive.txt"
   ```
 
-  Anything `held_back` here means backing the direct upgrade that pulled it in
-  out of this sweep.
+  Use `check-age` here, not `batch`. `batch` reports the newest version that
+  has cleared, so a locked version still inside the window comes back `ahead`
+  or `update`, never `held_back`. A check for `held_back` could never fire.
+  `TOO_NEW` (exit 5) means taking the direct upgrade that pulled it in out of
+  this sweep. `UNKNOWN` means the locked version is not a listed release
+  (yanked, deprecated or unpublished): stop and report it.
 
 **5. Verify.** Run the repo's build and tests, in every directory whose
 manifest changed. No test suite? Say so plainly rather than implying the
@@ -317,8 +370,11 @@ uncommitted.
 
 **7. Report.** Table of package, old → new, publication age. Then a separate
 **held back by cooloff** section with version and hours short — this is the most
-important part, it tells the user what to revisit tomorrow. Finish with the PR
-link, and list every repo skipped at the scope gate with the reason.
+important part, it tells the user what to revisit tomorrow. It lists every
+`; held back:` note and every `held_back` row from the step 2 table, plus any
+`TOO_NEW` from step 4. "None" is only true when the table shows neither.
+Finish with the PR link, and list every repo skipped at the scope gate with
+the reason.
 
 ## Judgment
 
@@ -359,7 +415,18 @@ Each of these cost repeated failed calls in past sweeps.
 - The Read tool on a directory fails (`EISDIR`) — use `ls`. The Write tool
   refuses a file you have not Read; for an existing file use Edit or a script.
 - `scan-deps` on a repo with no manifests prints nothing, and `batch -` then
-  prints `[]`: the repo is current, not broken.
+  prints `nothing to resolve` (`[]` with `--json`): the repo is current, not broken.
+- `batch` and `check-age` take specs as arguments, `-` for stdin, or a path to
+  a file of them. All three work. Before this was supported, `batch file.txt`
+  returned one `bad spec` row in 29 runs.
+- Toolchains on this machine: `go` is not on `PATH`, so prefix
+  `PATH="$HOME/sdk/go/bin:$PATH"` (7 runs hit `go: command not found`). There
+  is no `python3-venv` and no `uv`, so build venvs with `python3 -m venv
+  --without-pip "$SCRATCH/venv"` and install with `python3 -m pip --python
+  "$SCRATCH/venv/bin/python" install -r requirements.txt`.
+- Your report is your last call, made alone, after every other result is back.
+  Two runs sent it in the same turn as a cleanup command and delivered the
+  word `placeholder` instead of a report.
 - Do not poll CI with `sleep` loops. Step 5's local verification is the gate;
   after pushing, take at most one `gh pr checks <n> --repo <o>/<r>` snapshot and
   report anything still pending.

@@ -9,6 +9,10 @@ caught within hours. Refusing to adopt anything younger than N hours (default
 Subcommands
   pkg           newest version of a registry package that clears the cooloff
   action        newest release tag of a GitHub Action, resolved to a commit SHA
+  scan-deps     every dependency and workflow `uses:` in a tree, as batch specs
+  batch         resolve many specs concurrently (args, spec files, or stdin)
+  check-age     is each exact name@version (a lockfile entry) past the window?
+  pin-actions   rewrite workflow `uses:` lines from saved `batch` rows
   scan-actions  report every `uses:` in .github/workflows and its pin state
 
 Every command exits non-zero if nothing clears the cooloff, so it is safe to
@@ -20,12 +24,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import email.utils
+import http.client
 import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -248,11 +254,33 @@ def _cached(url: str, produce):
     return value
 
 
-def fetch_json(url: str, accept: str = "application/json"):
+# A dropped connection or a truncated body is not an answer. nextjs's sweep
+# lost eslint-config-next to `IncompleteRead` on a 7 MB packument and had to
+# re-query it by hand; one retry absorbs that. A 4xx is an answer -- never
+# retried.
+_TRANSIENT = (TimeoutError, ConnectionError, http.client.IncompleteRead,
+              http.client.RemoteDisconnected)
+
+
+def _read(req, timeout: float = 30, attempts: int = 2) -> bytes:
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if (e.code < 500 and e.code != 429) or attempt == attempts:
+                raise
+        except (urllib.error.URLError, *_TRANSIENT):
+            if attempt == attempts:
+                raise
+        time.sleep(1.5 * attempt)
+
+
+def fetch_json(url: str, accept: str = "application/json", timeout: float = 30,
+               attempts: int = 2):
     def go():
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return json.loads(_read(req, timeout, attempts).decode("utf-8"))
 
     return _cached(url, go)
 
@@ -260,8 +288,7 @@ def fetch_json(url: str, accept: str = "application/json"):
 def fetch_text(url: str) -> str:
     def go():
         req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8")
+        return _read(req).decode("utf-8")
 
     return _cached("text:" + url, go)
 
@@ -408,50 +435,85 @@ def versions_go(name: str, probe: int = 20):
     return out
 
 
-def versions_maven(name: str):
+def versions_maven(name: str, probe: int = 15):
+    """Versions maven-metadata.xml lists, dated by the search index or the POM.
+
+    The repository's maven-metadata.xml is what Maven itself resolves against,
+    so it decides which versions exist. search.maven.org only supplies dates
+    cheaply, and its index lags by months: on 2026-10-14 it topped out at
+    spotless-maven-plugin 2.44.5 and sofaboot-dependencies 4.4.1 while 3.10.4
+    and 4.6.0 were live. Trusting it whenever it answered made payment's
+    current pins read as `ahead` -- and whether a run saw the truth at all
+    depended on the search call timing out. Versions the index is missing
+    are dated from their POM's Last-Modified, newest first.
+    """
     if ":" not in name:
         die("maven packages must be given as group:artifact")
     group, artifact = name.split(":", 1)
+    dated = _maven_index_dates(group, artifact)
+    # No fallback to the index alone if this fails: a row that errors is
+    # honest, a stale index answer is the `ahead` this replaced.
+    listed = _maven_metadata_versions(group, artifact)
+    missing = sorted((v for v in listed if v not in dated), key=sort_key, reverse=True)
+    # Stable releases first, so a run of fresh milestones cannot use up the
+    # budget. Then the newest few on every other major line: with the index
+    # down, a --same-major lookup on an old line (a Dependabot floor on 2.x
+    # while 3.x ships) would otherwise find nothing dated at all.
+    stable = [v for v in missing if is_stable(v)]
+    picks = stable[:probe]
+    covered = {major_of(v) for v in picks}
+    older = {}
+    for v in stable[probe:]:
+        if major_of(v) not in covered and len(older.setdefault(major_of(v), [])) < 3:
+            older[major_of(v)].append(v)
+    picks += [v for line in older.values() for v in line]
+    picks += [v for v in missing if not is_stable(v)][:5]
+    for v in picks:
+        ts = _maven_pom_date(group, artifact, v)
+        if ts:
+            dated[v] = ts
+    return list(dated.items())
+
+
+def _maven_index_dates(group, artifact):
     q = urllib.parse.quote(f'g:"{group}" AND a:"{artifact}"')
-    out = []
+    out = {}
     try:
+        # Short and single-shot: the index only fills in dates, and
+        # versions_maven's POM probe covers anything it cannot answer.
         data = fetch_json(
-            f"https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=200&wt=json"
+            f"https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=200&wt=json",
+            timeout=15, attempts=1,
         )
-        for doc in data.get("response", {}).get("docs") or []:
-            ts = doc.get("timestamp")
-            if ts:
-                out.append((doc["v"], datetime.fromtimestamp(ts / 1000, tz=timezone.utc)))
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        pass
-    # search.maven.org times out often and lags new releases; it left payment's
-    # whole sweep unresolved. The repository itself is authoritative.
-    return out or _versions_maven_repo(group, artifact)
-
-
-def _versions_maven_repo(group, artifact, probe=15):
-    """Versions from maven-metadata.xml, dated by each POM's Last-Modified.
-
-    Only the newest `probe` versions are dated (one HEAD request each) --
-    enough to find the newest one that clears the window.
-    """
-    base = f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}"
-    xml = fetch_text(f"{base}/maven-metadata.xml")
-    versions = re.findall(r"<version>([^<]+)</version>", xml)
-    versions = [v for v in versions if parse_version(v) is not None]
-    versions.sort(key=sort_key, reverse=True)
-    out = []
-    for v in versions[:probe]:
-        req = urllib.request.Request(f"{base}/{v}/{artifact}-{v}.pom", method="HEAD",
-                                     headers={"User-Agent": UA})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                lm = resp.headers.get("Last-Modified")
-        except urllib.error.URLError:
-            continue
-        if lm:
-            out.append((v, email.utils.parsedate_to_datetime(lm).astimezone(timezone.utc)))
+    except (urllib.error.URLError, ValueError, *_TRANSIENT):
+        return out
+    for doc in (data or {}).get("response", {}).get("docs") or []:
+        ts = doc.get("timestamp")
+        if ts and doc.get("v"):
+            out[doc["v"]] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
     return out
+
+
+def _maven_base(group, artifact):
+    return f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}"
+
+
+def _maven_metadata_versions(group, artifact):
+    xml = fetch_text(f"{_maven_base(group, artifact)}/maven-metadata.xml")
+    return [v for v in re.findall(r"<version>([^<]+)</version>", xml)
+            if parse_version(v) is not None]
+
+
+def _maven_pom_date(group, artifact, version):
+    base = _maven_base(group, artifact)
+    req = urllib.request.Request(f"{base}/{version}/{artifact}-{version}.pom", method="HEAD",
+                                 headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            lm = resp.headers.get("Last-Modified")
+    except (urllib.error.URLError, *_TRANSIENT):
+        return None
+    return email.utils.parsedate_to_datetime(lm).astimezone(timezone.utc) if lm else None
 
 
 def versions_nuget(name: str):
@@ -623,7 +685,8 @@ def select(candidates, hours, allow_prerelease, same_major_as=None, max_major=No
     for ver, ts in considered:
         age = age_hours(ts)
         if age < hours:
-            skipped.append({"version": ver, "published": ts.isoformat(), "age_hours": round(age, 2)})
+            skipped.append({"version": ver, "published": ts.isoformat(),
+                            "age_hours": round(age, 2), "hours_short": round(hours - age, 2)})
             continue
         return (
             {"version": ver, "published": ts.isoformat(), "age_hours": round(age, 2)},
@@ -638,12 +701,18 @@ def select(candidates, hours, allow_prerelease, same_major_as=None, max_major=No
 # --------------------------------------------------------------------------
 
 
+_GH_TRANSIENT = re.compile(r"error connecting|timed? ?out|HTTP 5\d\d|connection reset", re.I)
+
+
 def gh_api(path: str, paginate: bool = False):
     def go():
         cmd = ["gh", "api", path]
         if paginate:
             cmd.insert(2, "--paginate")
         proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 and _GH_TRANSIENT.search(proc.stderr):
+            time.sleep(1.5)  # a dropped connection or a 504 is not an answer
+            proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or f"gh api {path} failed")
         text = proc.stdout.strip()
@@ -736,7 +805,8 @@ def resolve_action(ref, hours, allow_prerelease=False, same_major_only=False, ma
         published = max([tag_date] + ([release_dates[tag]] if tag in release_dates else []))
         age = age_hours(published)
         if age < hours:
-            skipped.append({"tag": tag, "published": published.isoformat(), "age_hours": round(age, 2)})
+            skipped.append({"tag": tag, "version": tag, "published": published.isoformat(),
+                            "age_hours": round(age, 2), "hours_short": round(hours - age, 2)})
             continue
         return {
             "kind": "action",
@@ -842,7 +912,12 @@ def _action_repo(uses: str) -> str:
     return "/".join(uses.split("@")[0].strip("/").split("/")[:2]).lower()
 
 
-def plan_pins(root: str, rows):
+def _major_jump(current, new) -> bool:
+    cur, nxt = major_of(current or ""), major_of(new or "")
+    return cur is not None and nxt is not None and nxt > cur
+
+
+def plan_pins(root: str, rows, skip_majors: bool = False):
     """Decide the rewrite for every `uses:` line from already-resolved batch rows.
 
     Sweeps used to spend a Read plus one Edit per `uses:` line, across every
@@ -851,7 +926,9 @@ def plan_pins(root: str, rows):
 
     Returns (changes, mismatches, left_alone). A line already pinned with the
     resolved tag in its comment but a *different* SHA is a mismatch: the tag
-    moved, which is a compromise signal, not an update.
+    moved, which is a compromise signal, not an update. With `skip_majors`,
+    a line whose rewrite would cross a major version is left alone and
+    returned with `major_to` set: a routine sweep must not carry a major.
     """
     by_repo = {}
     for r in rows:
@@ -870,6 +947,9 @@ def plan_pins(root: str, rows):
         if f["pinned"] and f["comment"] == row["tag"]:
             if ref != row["sha"]:
                 mismatches.append({**f, "expected_sha": row["sha"], "tag": row["tag"]})
+            continue
+        if skip_majors and _major_jump(f["comment"] if f["pinned"] else ref, row["tag"]):
+            left_alone.append({**f, "major_to": row["tag"]})
             continue
         changes.append({**f, "new": f"{path_part}@{row['sha']} # {row['tag']}"})
     return changes, mismatches, left_alone
@@ -899,12 +979,17 @@ def cmd_pin_actions(args):
     src = sys.stdin if args.results == "-" else open(args.results, encoding="utf-8")
     with src:
         rows = json.load(src)
-    changes, mismatches, left_alone = plan_pins(root, rows)
+    changes, mismatches, left_alone = plan_pins(root, rows, skip_majors=args.skip_majors)
 
     for c in changes:
         old = c["uses"] + (f" # {c['comment']}" if c["comment"] else "")
         print(f"{c['file']}:{c['line']}  {old}  ->  {c['new']}")
     for f in left_alone:
+        if f.get("major_to"):
+            old = f["uses"] + (f" # {f['comment']}" if f["comment"] else "")
+            print(f"note: major bump left for its own PR: {f['file']}:{f['line']}  "
+                  f"{old}  ->  {f['major_to']}", file=sys.stderr)
+            continue
         print(f"note: left unpinned (no pinnable batch row -- held back or errored?): "
               f"{f['file']}:{f['line']}  {f['uses']}", file=sys.stderr)
     if mismatches:
@@ -1309,12 +1394,34 @@ def _is_backwards(current, target):
     return sort_key(target) < sort_key(cur)
 
 
+def _identity(spec):
+    """The keys every batch row carries, whatever its kind or outcome.
+
+    Sweeps read rows with one-liners like `r['name']`. Action rows had no
+    `name` and error rows had nothing but `spec`, so those one-liners died
+    with KeyError at the first such row -- 20 runs did. vue-demo's then
+    filtered the actions out, and its PR skipped a scorecard-action bump the
+    same sweep applied to angular and dinoquest.
+    """
+    try:
+        eco, name, current = parse_spec(spec)
+    except ValueError:
+        return {"kind": None, "ecosystem": None, "name": spec, "current": None, "target": None}
+    if eco == "action":
+        path, _, ref = name.partition("@")
+        return {"kind": "action", "ecosystem": "action",
+                "name": "/".join(path.strip("/").split("/")[:2]),
+                "current": ref or None, "target": None}
+    return {"kind": "pkg", "ecosystem": eco, "name": name, "current": current, "target": None}
+
+
 def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe,
                  context_names=None):
+    ident = _identity(spec)
     try:
         eco, name, current = parse_spec(spec)
     except ValueError as e:
-        return {"spec": spec, "status": "error", "error": str(e)}
+        return {**ident, "spec": spec, "status": "error", "error": str(e)}
     try:
         if eco == "action":
             r = resolve_action(name, hours, allow_prerelease, same_major, max_probe)
@@ -1323,13 +1430,14 @@ def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe,
                             context_names)
     except ResolveError as e:
         return {
+            **ident,
             "spec": spec,
             "status": "held_back" if e.held_back else "error",
             "error": str(e),
             "skipped_too_new": e.held_back,
         }
     except Exception as e:  # one bad package must not sink the whole sweep
-        return {"spec": spec, "status": "error", "error": f"{type(e).__name__}: {e}"}
+        return {**ident, "spec": spec, "status": "error", "error": f"{type(e).__name__}: {e}"}
     r["spec"] = spec
     if not r.get("current"):
         # Nothing to compare against (a floating `gem "puma"`, an unpinned
@@ -1342,10 +1450,19 @@ def resolve_spec(spec, hours, allow_prerelease, same_major, max_probe,
         ceiling = r.get("ceiling") or {}
         r["status"] = "above_ceiling" if ceiling.get("applied") else "ahead"
         r["changed"] = False
-        r["downgrade_declined"] = {"from": r["current"], "to": r["target"]}
+        r["downgrade_declined"] = {"from": r["current"], "to": r["target"],
+                                   "to_age_hours": r.get("age_hours")}
         r["target"] = r["current"]
+        # The age fields described the declined version. Left in place they
+        # read as the pin's own age: pinia 4.1.0 showed "1585h old" while it
+        # was two hours old.
+        r["published"] = r["age_hours"] = None
     else:
         r["status"] = "update" if r.get("changed") else "current"
+    if r.get("kind") == "action":
+        # Added after the status is settled, so an action's status is decided
+        # exactly as before; this only lets one reader handle both kinds.
+        r.update(ecosystem="action", name=r["repo"], target=r["tag"])
     return r
 
 
@@ -1405,19 +1522,77 @@ def enforce_peer_coherence(results):
     return results
 
 
+def _read_specs(raw):
+    """Specs from arguments, `-` (stdin), and files listing one per line."""
+    specs, read_input = [], False
+    for a in raw:
+        if a == "-":
+            specs += sys.stdin.read().splitlines()
+            read_input = True
+        elif ":" not in a and os.path.isfile(a):
+            # `batch "$SCRATCH/transitive.txt"`: 29 past runs passed their spec
+            # list as an argument, got back a single `bad spec` error row, and
+            # spent another call re-running it through stdin.
+            with open(a, encoding="utf-8") as fh:
+                specs += fh.read().splitlines()
+            read_input = True
+        else:
+            specs.append(a)
+    return [s.strip() for s in specs], read_input
+
+
+def _needs_attention(r):
+    # A `current` row can still be hiding the most important line of a sweep
+    # report: a newer release waiting out the window.
+    return r["status"] != "current" or bool(r.get("skipped_too_new"))
+
+
+def _held_note(r):
+    held = r.get("skipped_too_new") or []
+    if not held or r["status"] == "held_back":  # its error already lists them
+        return ""
+
+    def one(h):
+        short = h.get("hours_short")
+        return (h.get("version") or h.get("tag")) + (f" ({short:.1f}h short)" if short is not None else "")
+
+    more = f" +{len(held) - 3} older" if len(held) > 3 else ""
+    return "; held back: " + ", ".join(one(h) for h in held[:3]) + more
+
+
+def _text_line(r, width):
+    if r["status"] in ("update", "resolved"):
+        target = f"{r['tag']} ({r['sha'][:12]}…)" if r.get("sha") else r.get("target")
+        detail = f"-> {target}  [{r['age_hours']:.0f}h old]"
+        if r["status"] == "resolved":
+            detail += "  (no version pinned in source)"
+    elif r["status"] == "current":
+        detail = "up to date"
+    elif r["status"] in ("above_ceiling", "ahead"):
+        d = r.get("downgrade_declined") or {}
+        why = (r.get("ceiling") or {}).get("reason")
+        detail = (f"pinned at {d.get('from')}, newest selectable is "
+                  f"{d.get('to')} -- keeping the pin, NOT a downgrade")
+        if why:
+            detail += f"  [ceiling: {why}]"
+    else:  # peer_held, held_back, error
+        detail = r["error"]
+    return f"{r['status'].upper():<10} {r['spec']:<{width}}  {detail}{_held_note(r)}"
+
+
 def cmd_batch(args):
-    specs = list(args.specs)
-    from_stdin = not specs or specs == ["-"]
-    if from_stdin:
-        specs = [l.strip() for l in sys.stdin.read().splitlines()]
+    specs, read_input = _read_specs(list(args.specs) or ["-"])
     specs = [s for s in specs if s and not s.startswith("#")]
     if not specs:
-        if from_stdin and args.specs == ["-"]:
+        if read_input and args.specs:
             # `scan-deps | batch -` on a repo with no manifests: nothing to
             # resolve is a result ("current"), not a failure to go debug.
+            if args.out:
+                with open(args.out, "w", encoding="utf-8") as fh:
+                    fh.write("[]\n")
             print("[]" if args.json else "nothing to resolve")
             return
-        die("no specs given (pass them as arguments or on stdin)")
+        die("no specs given (pass them as arguments, a file of specs, or `-` for stdin)")
 
     # Registry calls are almost entirely network wait, so they overlap well.
     # Keep the pool modest: these are public registries and `gh` subprocesses.
@@ -1444,36 +1619,132 @@ def cmd_batch(args):
 
     enforce_peer_coherence(results)
 
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2)
+            fh.write("\n")
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        # With --out the file holds every row, so the screen only needs the
+        # rows a sweep must act on or report -- the whole work list, readable,
+        # with no script of the caller's own to get wrong.
+        shown = [r for r in results if _needs_attention(r)] if args.out else results
+        width = max((len(r["spec"]) for r in shown), default=0)
+        for r in shown:
+            print(_text_line(r, width))
+        counts = {}
+        for r in results:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+        if args.out:
+            print(f"\n{summary} -- every row in {args.out}")
+        else:
+            print("\n" + summary, file=sys.stderr)
+
+    if any(r["status"] == "error" for r in results):
+        sys.exit(3)
+
+
+# --------------------------------------------------------------------------
+# exact-version age (lockfile entries)
+# --------------------------------------------------------------------------
+
+
+def exact_published(eco, name, version):
+    """When exactly `name@version` was published, or None if it is not a
+    listed release (yanked, deprecated, unpublished, or never existed)."""
+    if eco == "action":
+        repo = "/".join(name.strip("/").split("/")[:2])
+        release_dates, tags = action_tag_dates(repo)
+        if version not in tags:
+            return None
+        _, tag_date = resolve_commit(repo, version)
+        return max([tag_date] + ([release_dates[version]] if version in release_dates else []))
+    if eco == "go":
+        # The proxy dates any version directly; versions_go only dates the newest.
+        base = f"https://proxy.golang.org/{_go_escape(name)}"
+        try:
+            return parse_ts(fetch_json(f"{base}/@v/{_go_escape(version)}.info").get("Time", ""))
+        except urllib.error.HTTPError:
+            return None
+    if eco == "maven":
+        group, artifact = name.split(":", 1)
+        for v, ts in _maven_index_dates(group, artifact).items():
+            if same_version(v, version):
+                return ts
+        return _maven_pom_date(group, artifact, version)
+    # No `latest` cap: a lockfile can legitimately hold a version above it.
+    candidates = versions_npm(name, allow_prerelease=True) if eco == "npm" else FETCHERS[eco](name)
+    for v, ts in candidates:
+        if same_version(v, version):
+            return ts
+    return None
+
+
+def check_age(spec, hours):
+    row = {**_identity(spec), "spec": spec}
+    try:
+        eco, name, version = parse_spec(spec)
+        if eco == "action":
+            name, _, version = name.partition("@")
+        if not version:
+            raise ValueError("needs an exact version: ecosystem:name@version")
+        ts = exact_published(eco, name, strip_range_ops(version))
+    except Exception as e:  # one bad entry must not sink the check
+        return {**row, "status": "error", "error": f"{type(e).__name__}: {e}"}
+    if ts is None:
+        return {**row, "status": "unknown",
+                "error": "not a listed release -- yanked, deprecated, unpublished, or a typo"}
+    age = age_hours(ts)
+    row.update(published=ts.isoformat(), age_hours=round(age, 2))
+    if age < hours:
+        row.update(status="too_new", hours_short=round(hours - age, 2))
+    else:
+        row["status"] = "ok"
+    return row
+
+
+def cmd_check_age(args):
+    """Is each exact version older than the window?
+
+    The question a regenerated lockfile poses, and one `batch` cannot answer:
+    `batch` reports the newest version that has cleared, so a locked version
+    still inside the window came back `ahead` -- or `update`, when a newer
+    release had already cleared -- and slipped past every sweep that checked
+    its transitive entries for `held_back`.
+    """
+    specs, read_input = _read_specs(list(args.specs) or ["-"])
+    specs = [s for s in specs if s and not s.startswith("#")]
+    if not specs:
+        if read_input and args.specs:
+            print("[]" if args.json else "nothing to check")
+            return
+        die("no specs given (pass them as arguments, a file of specs, or `-` for stdin)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        results = list(pool.map(lambda s: check_age(s, args.hours), specs))
+
     if args.json:
         print(json.dumps(results, indent=2))
     else:
         width = max(len(r["spec"]) for r in results)
         for r in results:
-            if r["status"] in ("update", "resolved"):
-                target = f"{r['tag']} ({r['sha'][:12]}…)" if r.get("sha") else r.get("target")
-                detail = f"-> {target}  [{r['age_hours']:.0f}h old]"
-                if r["status"] == "resolved":
-                    detail += "  (no version pinned in source)"
-            elif r["status"] == "current":
-                detail = "up to date"
-            elif r["status"] in ("above_ceiling", "ahead"):
-                d = r.get("downgrade_declined") or {}
-                why = (r.get("ceiling") or {}).get("reason")
-                detail = (f"pinned at {d.get('from')}, newest selectable is "
-                          f"{d.get('to')} -- keeping the pin, NOT a downgrade")
-                if why:
-                    detail += f"  [ceiling: {why}]"
-            elif r["status"] == "peer_held":
-                detail = r["error"]
+            if r["status"] == "ok":
+                detail = f"{r['age_hours']:.0f}h old"
+            elif r["status"] == "too_new":
+                detail = (f"{r['age_hours']:.1f}h old -- {r['hours_short']:.1f}h short "
+                          f"of the {args.hours:g}h window")
             else:
                 detail = r["error"]
-            print(f"{r['status'].upper():<10} {r['spec']:<{width}}  {detail}")
+            print(f"{r['status'].upper():<8} {r['spec']:<{width}}  {detail}")
         counts = {}
         for r in results:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
-        print("\n" + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())), file=sys.stderr)
+        print("\n" + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
 
-    if any(r["status"] == "error" for r in results):
+    if any(r["status"] == "too_new" for r in results):
+        sys.exit(5)
+    if any(r["status"] in ("unknown", "error") for r in results):
         sys.exit(3)
 
 
@@ -1505,10 +1776,12 @@ def main():
     ss.set_defaults(func=cmd_scan_actions)
 
     spn = sub.add_parser("pin-actions",
-                         help="rewrite every workflow `uses:` from saved `batch --json` output")
-    spn.add_argument("results", help="batch --json output file, or `-` for stdin")
+                         help="rewrite every workflow `uses:` from saved `batch` rows")
+    spn.add_argument("results", help="`batch --out` (or --json) file, or `-` for stdin")
     spn.add_argument("--dir", default=".")
     spn.add_argument("--dry-run", action="store_true", help="print the rewrites, write nothing")
+    spn.add_argument("--skip-majors", action="store_true",
+                     help="leave rewrites that cross a major version alone, and list them")
     spn.set_defaults(func=cmd_pin_actions)
 
     sd = sub.add_parser("scan-deps", help="list every dependency in the tree as a batch spec")
@@ -1518,11 +1791,26 @@ def main():
     sd.set_defaults(func=cmd_scan_deps)
 
     sb = sub.add_parser("batch", parents=[common],
-                        help="resolve many specs concurrently (args or stdin)")
-    sb.add_argument("specs", nargs="*", help="ecosystem:name[@current], or `-` for stdin")
+                        help="resolve many specs concurrently (args, files, or stdin)")
+    sb.add_argument("specs", nargs="*",
+                    help="ecosystem:name[@current], a file of specs, or `-` for stdin")
+    sb.add_argument("--out", metavar="FILE",
+                    help="also write the JSON rows to FILE; print only rows that need attention")
     sb.add_argument("--jobs", "-j", type=int, default=8, help="concurrent resolutions (default 8)")
     sb.add_argument("--max-probe", type=int, default=10, help="tags to inspect per action")
     sb.set_defaults(func=cmd_batch)
+
+    sc = sub.add_parser("check-age",
+                        help="is each exact ecosystem:name@version older than the window? "
+                             "(exit 5 if any is not)")
+    sc.add_argument("specs", nargs="*",
+                    help="ecosystem:name@version, a file of them, or `-` for stdin")
+    sc.add_argument("--hours", type=float,
+                    default=float(os.environ.get("COOLOFF_HOURS", DEFAULT_HOURS)),
+                    help=f"minimum age in hours (default {DEFAULT_HOURS}, or $COOLOFF_HOURS)")
+    sc.add_argument("--json", action="store_true")
+    sc.add_argument("--jobs", "-j", type=int, default=8, help="concurrent lookups (default 8)")
+    sc.set_defaults(func=cmd_check_age)
 
     args = p.parse_args()
     args.func(args)
