@@ -35,10 +35,17 @@ done
 | `isFork: true` | **Stop. Skip the repo.** Never push dependency commits to a fork. |
 | `isArchived: true` | Stop. Skip. |
 | `viewerPermission` not WRITE/MAINTAIN/ADMIN | Stop. Skip — you cannot push a branch. |
-| Working tree dirty | Stop. Report. Never stash someone else's work. |
+| Tracked changes — `git status --porcelain --untracked-files=no` prints anything | Stop. Report. Never stash someone else's work. |
 
 Report every skip and why. A listed repo that now fails the gate is worth
 saying out loud — the list is stale.
+
+**Untracked files alone do not fail the gate.** A `??`-only tree — almost
+always `.claude/` or `.claude/worktrees/` left by another session — is clean
+for this purpose: proceed, leave those files exactly where they are, and stage
+only the paths you changed (step 6), so they can never reach a commit. The
+2026-10-18 sweep had two agents skip a repo over a bare `.claude/worktrees/`
+while three others proceeded past the same thing.
 
 ## The tool
 
@@ -177,9 +184,16 @@ scripts/cooloff.py scan-deps --dir . | scripts/cooloff.py batch - --out "$SCRATC
 - No `update` rows: report current and stop. No install, no PR, and **no
   leftover branch**: switch back to the branch you recorded in step 1 and
   delete the one you created (`git checkout <start> && git branch -D <yours>`).
-  Past sweeps left checkouts parked on empty `chore/deps-*` branches. Do the
-  same whenever you end a repo with nothing committed. (A fresh clone under
-  `$SCRATCH` is thrown away, so it needs no cleanup.)
+  Do the same whenever you end a repo with nothing committed. (A fresh clone
+  under `$SCRATCH` is thrown away, so it needs no cleanup.)
+- **Delete only that one branch, by its literal name.** Never a glob, a
+  `git branch --list 'chore/deps-*' | xargs`, or a loop: older `chore/deps-*`
+  branches in the checkout belong to someone — earlier PRs, the user's
+  experiments — and are not yours to tidy. Four agents in the 2026-10-18
+  sweep (test-agents, doom-clone, sonatype, multicloud) deleted pre-existing
+  branches that way and had to recreate them from `branch -D` output; the
+  upstream tracking config could not be recovered. Leftover branches are a
+  report line, never a cleanup task.
 - Everything below edits files to match decisions this step already made. Do
   not re-run `scan-deps` to "check", do not re-query per package with `pkg`,
   `npm view`, or a hand-written registry fetch, and do not re-run the sweep
@@ -340,6 +354,8 @@ drop the offending upgrade, and say which.
 say the repo is current and stop. Otherwise, once step 5 is green:
 
 - Commit per ecosystem (`npm`, `pypi`, actions, …) so one bad update reverts alone.
+  Stage by path (`git add package.json package-lock.json`), never `git add -A`
+  or `git add .` — the checkout may hold untracked files that are not yours.
 - `git push -u origin <branch>` then `gh pr create`.
 - Title: `chore(deps): update N dependencies (24h cooloff)`.
 - Body, in this order: updated table (package, old → new, publication age); the

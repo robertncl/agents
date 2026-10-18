@@ -55,7 +55,7 @@ means the alerts call failed — handle per the last row below.
 | `isFork: true` | **Stop. Skip the repo.** Never push independent fix commits to a fork. |
 | `isArchived: true` | Stop. Skip. |
 | `viewerPermission` not WRITE/MAINTAIN/ADMIN | Stop. Skip — you cannot push a branch, and finding out after ten fixes wastes the run. |
-| Working tree dirty | Stop. Report. Never stash someone else's work. |
+| Tracked changes — `git status --porcelain --untracked-files=no` prints anything | Stop. Report. Never stash someone else's work. Untracked files alone (usually `.claude/`) are not a gate failure: leave them, and stage only the paths you changed. |
 | `dependabot/alerts` returns 403/404 | Check you used the query-string form from Tools (no `-f`). Then confirm via `gh api -i /repos/<o>/<r>/vulnerability-alerts` (204 = enabled) whether alerts are disabled or the token lacks `security_events`, say which, skip. **Never** substitute `npm audit` and call it "the Dependabot alerts." |
 
 Report every skip and why.
