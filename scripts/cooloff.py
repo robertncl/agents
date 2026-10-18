@@ -1087,8 +1087,11 @@ def cmd_pkg(args):
 # registry publication date, so there is nothing to cool off.
 _UNRESOLVABLE = ("file:", "link:", "workspace:", "git+", "git:", "http:", "https:",
                  "portal:", "patch:", "npm:", "catalog:")
+# `.claude` holds agent worktrees (`.claude/worktrees/<name>/`), full copies of
+# the repo at some older commit: scanning them fed pokedev's 2026-10-18 sweep
+# stale manifests and wrong rows for packages the tracked tree no longer has.
 _SKIP_DIRS = {".git", "node_modules", "vendor", "target", "dist", "build",
-              ".venv", "venv", "__pycache__", ".tox", ".mypy_cache"}
+              ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".claude"}
 
 
 def _walk(root: str):
@@ -1372,10 +1375,13 @@ def parse_spec(spec: str):
     """`npm:react@^18.2.0`, `pypi:requests`, `action:actions/checkout@v4`."""
     spec = spec.strip()
     eco, sep, rest = spec.partition(":")
+    known = ", ".join(ECOSYSTEMS + ("action",))
     if not sep or not rest:
-        raise ValueError(f"bad spec {spec!r} — expected ecosystem:name[@current]")
+        raise ValueError(f"bad spec {spec!r} — expected ecosystem:name[@current], "
+                         f"ecosystem one of {known} (e.g. npm:{spec})")
     if eco not in ECOSYSTEMS and eco != "action":
-        raise ValueError(f"bad spec {spec!r} — unknown ecosystem {eco!r}")
+        raise ValueError(f"bad spec {spec!r} — unknown ecosystem {eco!r}, "
+                         f"expected one of {known}")
     if eco == "action":
         return eco, rest, None
     name, at, current = rest.rpartition("@")

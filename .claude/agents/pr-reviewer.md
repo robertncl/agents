@@ -93,9 +93,14 @@ read of the lockfile:
 - New `install`/`postinstall` scripts or new packages in the lockfile: call out.
 - Go: `go.mod` changed ⇒ `go.sum` changed too.
 - **The 24h cooloff, checked independently.** Put every added or bumped
-  `name@version` (manifest and lockfile, `action:owner/repo@tag` for workflow
-  pins) in one file and run `/home/robert/code/agents/scripts/cooloff.py
-  check-age <file>`. Any `TOO_NEW` (exit 5) means a version younger than the
+  version (manifest and lockfile) in one file, one `ecosystem:name@version`
+  per line, and run `/home/robert/code/agents/scripts/cooloff.py check-age
+  <file>`. The prefix is required: `npm:@angular/core@22.2.3`,
+  `pypi:platformdirs@4.13.3`, `maven:com.fasterxml.jackson:jackson-bom@2.22.3`,
+  `go:golang.org/x/crypto@v0.58.0`, `crates:`, `rubygems:`, `nuget:`, and
+  `action:owner/repo@tag` for workflow pins. A bare `name@version` or `pip:`
+  is a `bad spec` error, which at least four of eleven reviewers in the 2026-10-18
+  sweep hit before retrying. Any `TOO_NEW` (exit 5) means a version younger than the
   window got in. That is a supply-chain finding, `REQUEST_CHANGES` on its
   merits, whatever the PR body claims.
 - **A security fix must contain the fix.** For a `fix(deps)` PR, read each

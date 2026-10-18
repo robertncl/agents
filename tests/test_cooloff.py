@@ -408,6 +408,31 @@ class TestBatchInput(unittest.TestCase):
                          ["npm:vitest@5.0.4", "npm:obug@3.0.0", "pypi:ruff@0.17.0"])
 
 
+class TestSpecErrors(unittest.TestCase):
+    def test_bad_spec_names_the_prefixes(self):
+        # Reviewers in the 2026-10-18 sweep passed `@angular/core@22.2.3` and
+        # `pip:platformdirs@4.13.3` and had to guess what the tool wanted.
+        with self.assertRaisesRegex(ValueError, r"npm, pypi.*e\.g\. npm:@angular/core@22\.2\.3"):
+            cooloff.parse_spec("@angular/core@22.2.3")
+        with self.assertRaisesRegex(ValueError, r"unknown ecosystem 'pip', expected one of npm, pypi"):
+            cooloff.parse_spec("pip:platformdirs@4.13.3")
+
+
+class TestWalkSkips(unittest.TestCase):
+    def test_agent_worktrees_under_dot_claude_are_not_scanned(self):
+        # pokedev's 2026-10-18 sweep read stale manifests out of
+        # .claude/worktrees/<name>/ and resolved packages the repo had dropped.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            stale = os.path.join(root, ".claude", "worktrees", "old", "mobile")
+            os.makedirs(stale)
+            open(os.path.join(stale, "package.json"), "w").close()
+            open(os.path.join(root, "package.json"), "w").close()
+            found = [os.path.relpath(os.path.join(d, f), root)
+                     for d, f in cooloff._walk(root)]
+        self.assertEqual(found, ["package.json"])
+
+
 class TestHeldBackReporting(unittest.TestCase):
     """closeclaw#30 and vue-demo#112 both said "held back: none" while
     lucide-react 1.57.0, pinia 4.1.0 and eslint-plugin-oxlint 1.88.0 sat
