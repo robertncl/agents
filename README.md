@@ -61,9 +61,8 @@ They compose into one security-maintenance pass over a repo:
 
 That order matters: fix the known CVEs first as isolated PRs, do the routine
 sweep second so it doesn't bundle security fixes into an unrelated diff, and
-review last. Security fixes from `dependabot-fixer` still wait out a 24h
-cooloff. Routine updates from `dependency-updater` take the latest release
-with no window.
+review last. Neither agent applies a cooloff window any more (both run
+`cooloff.py --hours 0`): a release is eligible as soon as it is published.
 
 None of them is a background watcher — each run is a fresh sweep, so recurring
 coverage means re-running them. `/pr-watch` wrapped in `/loop` covers the review
@@ -148,10 +147,9 @@ What it does:
 
 - Treats `first_patched_version` as a floor and resolves the newest release
   on the floor's **major line** (`batch --same-major` with the floor as
-  `@current`) that clears a 24h cooloff window.
-  It crosses a major only when no backport exists, and then only to the
-  floor's major. A CVE patch published minutes ago gets held back and surfaced
-  as a tradeoff, not adopted silently.
+  `@current`), with no cooloff window: a patch is adopted as soon as it is
+  published. It crosses a major only when no backport exists, and then only
+  to the floor's major.
 - Never treats "newer than the vulnerable range" as a fix when the advisory
   names no patched version. Such advisories list every release up to the
   newest, so the next release is outside the range whether or not it fixes
@@ -166,8 +164,8 @@ What it does:
 - Never uses `--legacy-peer-deps`/`--force` to get an install through, reports
   the exact build/test commands it ran, and processes every open alert rather
   than stopping at a self-chosen batch.
-- Re-checks the regenerated lockfile's newly added transitive entries against
-  the cooloff, and pins vulnerable GitHub Actions to full commit SHAs.
+- Checks that the regenerated lockfile's newly added transitive entries are
+  real, listed releases, and pins vulnerable GitHub Actions to full commit SHAs.
 - Skips packages Dependabot already has an open PR for, and branches every fix
   off a fresh default branch so the PRs stay independently mergeable.
 - Never merges, auto-merges, or dismisses an alert; opens a draft PR (flagged)
@@ -180,11 +178,7 @@ access or `security_events` scope.
 > use the dependabot-fixer agent on robertncl/my-service
 > use the dependabot-fixer agent on this repo, critical and high alerts only
 > use the dependabot-fixer agent on ~/code/my-service but just report — no PRs yet
-> the lodash patch is 6h old and actively exploited; rerun dependabot-fixer with --hours 1
 ```
-
-That last one is the only way a sub-cooloff version gets adopted: the agent
-holds it and hands you the tradeoff, and you decide.
 
 ## dependency-updater
 
@@ -221,7 +215,8 @@ upstream rather than being pushed independently.
 
 ### scripts/cooloff.py
 
-The version resolver the agent relies on. Usable standalone and in CI:
+The version resolver the agents rely on. Usable standalone and in CI. Its
+`--hours` default is still 24; the agents override it with `--hours 0`.
 
 ```bash
 # whole repo in one pass: every manifest + every workflow `uses:`. Saves every
