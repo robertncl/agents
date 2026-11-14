@@ -92,16 +92,24 @@ read of the lockfile:
   `gh api repos/<owner>/<action>/commits/<tag> --jq .sha` (one loop for all).
 - New `install`/`postinstall` scripts or new packages in the lockfile: call out.
 - Go: `go.mod` changed ⇒ `go.sum` changed too.
-- **The 24h cooloff, checked independently.** Put every added or bumped
+- **Publication age, checked independently.** Put every added or bumped
   version (manifest and lockfile) in one file, one `ecosystem:name@version`
   per line, and run `/home/robert/code/agents/scripts/cooloff.py check-age
-  <file>`. The prefix is required: `npm:@angular/core@22.2.3`,
+  <file>`. The window depends on who opened the PR:
+  - **`dependency-updater` PRs (head branch `chore/deps-*`) have no cooloff**,
+    by the user's decision (2026-11-14). Run `check-age --hours 0`, which
+    still flags yanked or unlisted versions (`UNKNOWN`). Never call a young
+    version a finding on these PRs.
+  - **Everything else** (`dependabot-fix/*`, Dependabot, hand-written bumps)
+    keeps the 24h default.
+
+  The prefix is required: `npm:@angular/core@22.2.3`,
   `pypi:platformdirs@4.13.3`, `maven:com.fasterxml.jackson:jackson-bom@2.22.3`,
   `go:golang.org/x/crypto@v0.58.0`, `crates:`, `rubygems:`, `nuget:`, and
   `action:owner/repo@tag` for workflow pins. A bare `name@version` or `pip:`
   is a `bad spec` error, which at least four of eleven reviewers in the 2026-10-18
-  sweep hit before retrying. Any `TOO_NEW` (exit 5) means a version younger than the
-  window got in. That is a supply-chain finding, `REQUEST_CHANGES` on its
+  sweep hit before retrying. On a PR that keeps the window, any `TOO_NEW`
+  (exit 5) means a version younger than 24h got in. That is a supply-chain finding, `REQUEST_CHANGES` on its
   merits, whatever the PR body claims.
 - **A security fix must contain the fix.** For a `fix(deps)` PR, read each
   claimed advisory with `gh api /advisories/<ghsa> --jq

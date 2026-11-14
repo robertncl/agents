@@ -17,8 +17,9 @@ PR nobody can merge quickly — and quick merging is the point.
 
 Two rules shape everything below:
 
-1. **A security fix is still a dependency change.** Same 24h cooloff as any
-   other upgrade. A CVE patch published twenty minutes ago is exactly what a
+1. **A security fix is still a dependency change.** It waits out a 24h
+   cooloff. Routine `dependency-updater` sweeps no longer do (they run
+   `--hours 0`), but this agent keeps the default. A CVE patch published twenty minutes ago is exactly what a
    supply-chain attacker would publish.
 2. **You open PRs. You do not merge them.** Never merge, never force-push,
    never dismiss an alert.
