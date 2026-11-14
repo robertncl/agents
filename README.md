@@ -5,7 +5,7 @@ Claude Code subagents and supporting tooling.
 | Agent | Does | Writes to your repo? |
 | --- | --- | --- |
 | [`dependabot-fixer`](#dependabot-fixer) | Turns open Dependabot alerts into minimal fix PRs | PR per direct fix + one transitive PR per manifest (never merges) |
-| [`dependency-updater`](#dependency-updater) | Routine dependency/Action upgrades past a 24h cooloff | Branch + PR when there's anything to update (never merges) |
+| [`dependency-updater`](#dependency-updater) | Routine dependency/Action upgrades to the latest release (no cooloff) | Branch + PR when there's anything to update (never merges) |
 | [`pr-reviewer`](#pr-reviewer) | Reviews open PRs for security + quality, posts a real GitHub review | Review comments only |
 
 All three agents are pinned to `model: claude-sonnet-5-5` (Sonnet 5.5). The
@@ -61,8 +61,8 @@ They compose into one security-maintenance pass over a repo:
 
 That order matters: fix the known CVEs first as isolated PRs, do the routine
 sweep second so it doesn't bundle security fixes into an unrelated diff, and
-review last. All three share the same cooloff rule, so nothing published in the
-last 24 hours enters the repo along the way.
+review last. Neither agent applies a cooloff window any more (both run
+`cooloff.py --hours 0`): a release is eligible as soon as it is published.
 
 None of them is a background watcher — each run is a fresh sweep, so recurring
 coverage means re-running them. `/pr-watch` wrapped in `/loop` covers the review
@@ -147,10 +147,9 @@ What it does:
 
 - Treats `first_patched_version` as a floor and resolves the newest release
   on the floor's **major line** (`batch --same-major` with the floor as
-  `@current`) that clears the same 24h cooloff window as `dependency-updater`.
-  It crosses a major only when no backport exists, and then only to the
-  floor's major. A CVE patch published minutes ago gets held back and surfaced
-  as a tradeoff, not adopted silently.
+  `@current`), with no cooloff window: a patch is adopted as soon as it is
+  published. It crosses a major only when no backport exists, and then only
+  to the floor's major.
 - Never treats "newer than the vulnerable range" as a fix when the advisory
   names no patched version. Such advisories list every release up to the
   newest, so the next release is outside the range whether or not it fixes
@@ -165,8 +164,8 @@ What it does:
 - Never uses `--legacy-peer-deps`/`--force` to get an install through, reports
   the exact build/test commands it ran, and processes every open alert rather
   than stopping at a self-chosen batch.
-- Re-checks the regenerated lockfile's newly added transitive entries against
-  the cooloff, and pins vulnerable GitHub Actions to full commit SHAs.
+- Checks that the regenerated lockfile's newly added transitive entries are
+  real, listed releases, and pins vulnerable GitHub Actions to full commit SHAs.
 - Skips packages Dependabot already has an open PR for, and branches every fix
   off a fresh default branch so the PRs stay independently mergeable.
 - Never merges, auto-merges, or dismisses an alert; opens a draft PR (flagged)
@@ -179,22 +178,14 @@ access or `security_events` scope.
 > use the dependabot-fixer agent on robertncl/my-service
 > use the dependabot-fixer agent on this repo, critical and high alerts only
 > use the dependabot-fixer agent on ~/code/my-service but just report — no PRs yet
-> the lodash patch is 6h old and actively exploited; rerun dependabot-fixer with --hours 1
 ```
-
-That last one is the only way a sub-cooloff version gets adopted: the agent
-holds it and hands you the tradeoff, and you decide.
 
 ## dependency-updater
 
 Reviews a git repository and updates dependencies and GitHub Actions to the
-latest version that has **survived a cooloff window** — 24 hours by default.
-
-The threat it addresses: most registry supply chain attacks (compromised
-maintainer account, hijacked action tag, typosquat) are detected and yanked
-within hours of publication. Refusing to adopt anything younger than a day
-removes the window the attacker is counting on, at the cost of being one day
-behind latest.
+**latest published version**, with **no cooloff window**. It runs
+`cooloff.py` with `--hours 0`. The npm `latest` cap, version ceilings, peer
+checks, SHA pinning and yanked-version detection all still apply.
 
 It discovers every manifest in the tree in one pass, resolves all dependencies
 concurrently, and **opens a PR when there is anything to update** (it never
@@ -206,8 +197,8 @@ What it does:
   trailing comment (`uses: actions/checkout@8f4b... # v5.0.1`), since tags are
   mutable and SHAs are not.
 - Resolves package versions to exact pins backed by a committed lockfile, and
-  re-checks newly introduced transitive dependencies against the same cooloff.
-- Reports what it held back and by how many hours, so you know what to revisit.
+  checks that every newly introduced transitive version is a listed release.
+- Reports what it did not update and why (peer range, ceiling, major bump).
 
 Invoke it by asking Claude Code to update dependencies in a repo, or explicitly:
 
@@ -224,7 +215,8 @@ upstream rather than being pushed independently.
 
 ### scripts/cooloff.py
 
-The version resolver the agent relies on. Usable standalone and in CI:
+The version resolver the agents rely on. Usable standalone and in CI. Its
+`--hours` default is still 24; the agents override it with `--hours 0`.
 
 ```bash
 # whole repo in one pass: every manifest + every workflow `uses:`. Saves every
